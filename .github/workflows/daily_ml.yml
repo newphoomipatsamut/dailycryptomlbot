@@ -1,0 +1,31 @@
+name: Daily ML Bot
+
+on:
+  schedule:
+    - cron: '5 0 * * *'   # runs 00:05 UTC every day
+  workflow_dispatch:        # allows manual run from GitHub UI
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements_daily.txt
+
+      - name: Run bot
+        env:
+          KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_SECRET:     ${{ secrets.KRAKEN_SECRET }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
+          PAPER_MODE:        "true"
+          PAPER_BALANCE:     "10000"
+        run: python crypto_daily_ml_v3.py
