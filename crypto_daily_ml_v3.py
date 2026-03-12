@@ -89,7 +89,7 @@ SYMBOLS          = ['ETH/USDT', 'SOL/USDT', 'LINK/USDT']
 
 PAPER_MODE       = os.environ.get('PAPER_MODE', 'true').lower() == 'true'
 STARTING_BALANCE = float(os.environ.get('PAPER_BALANCE', 10000.0))
-RISK_PER_TRADE   = 0.15          # raised from 0.10 — validated by backtest
+RISK_PER_TRADE   = 0.25          # raised from 0.10 — validated by backtest
 TAKE_PROFIT_PCT  = 0.030
 STOP_LOSS_PCT    = 0.010
 MAX_HOLD_DAYS    = 5
