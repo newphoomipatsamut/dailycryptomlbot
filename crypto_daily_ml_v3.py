@@ -140,9 +140,10 @@ def init_sheets():
             'hold_days', 'win', 'balance_after',
             'signal_prob', 'rf_prob', 'xgb_prob',
         ])
-        signals_ws = get_or_create('DailySignals', 50000, 11, [
-            'date', 'symbol', 'close', 'signal_prob', 'rf_prob', 'xgb_prob',
-            'prediction', 'rsi', 'atr_pct', 'ofi_snapshot', 'ofi_gate_pass',
+        signals_ws = get_or_create('DailySignals', 50000, 13, [
+            'date', 'symbol', 'close', 'ensemble_prob', 'rf_prob', 'xgb_prob',
+            'signal_fired', 'reject_reason', 'ofi_value', 'ofi_gate_pass',
+            'rsi', 'atr_pct', 'in_position',
         ])
         # FIX BUG 1: Meta tab stores persistent balance
         meta_ws    = get_or_create('DailyMeta', 100, 3, [
@@ -648,11 +649,49 @@ def _next_row_id(trades_ws) -> str:
     except Exception:
         return f'T{int(datetime.now().timestamp())}'
 
+def log_signal(signals_ws, today: str, symbol: str,
+               close_px: float, signal: dict,
+               ofi_val: float, features_row: pd.Series,
+               signal_fired: bool, reject_reason: str,
+               in_position: bool) -> None:
+    """
+    Log every symbol's daily signal to DailySignals — even when no trade fires.
+    This is the rejection log: shows WHY each symbol didn't trade each day.
+    reject_reason values:
+      NONE              — signal fired, trade entered
+      PROB_TOO_LOW      — ensemble prob below SIGNAL_THRESHOLD
+      OFI_NEGATIVE      — ML signal but OFI gate blocked entry
+      ALREADY_IN_POS    — already holding this symbol
+      MAX_POSITIONS     — at max concurrent positions
+      INSUFFICIENT_DATA — not enough bars to train
+    """
+    if signals_ws is None:
+        return
+    try:
+        signals_ws.append_row([
+            today,
+            symbol,
+            round(close_px, 6),
+            round(signal.get('ensemble_prob', 0), 4),
+            round(signal.get('rf_prob', 0), 4),
+            round(signal.get('xgb_prob', 0), 4),
+            signal_fired,
+            reject_reason,
+            round(ofi_val, 4),
+            'YES' if ofi_val > OFI_GATE else 'NO',
+            round(float(features_row.get('rsi', 0)), 2),
+            round(float(features_row.get('atr_pct', 0)) * 100, 4),
+            in_position,
+        ], value_input_option='RAW')
+    except Exception as e:
+        logger.error(f'Log signal failed: {e}')
+
+
 def log_entry(trades_ws, signals_ws, today: str, symbol: str,
               entry_price: float, signal: dict,
               ofi_val: float, balance: float,
               features_row: pd.Series) -> str:
-    """Log new trade entry. Returns row_id for later exit update."""
+    """Log new trade entry to DailyTrades. Returns row_id for later exit update."""
     row_id = _next_row_id(trades_ws) if trades_ws else 'T0000'
 
     if trades_ws:
@@ -669,21 +708,11 @@ def log_entry(trades_ws, signals_ws, today: str, symbol: str,
         except Exception as e:
             logger.error(f'Log entry failed: {e}')
 
-    if signals_ws:
-        try:
-            signals_ws.append_row([
-                today, symbol, round(entry_price, 6),
-                round(signal['ensemble_prob'], 4),
-                round(signal['rf_prob'], 4),
-                round(signal['xgb_prob'], 4),
-                'BUY',
-                round(float(features_row.get('rsi', 0)), 2),
-                round(float(features_row.get('atr_pct', 0)) * 100, 4),
-                round(ofi_val, 4),
-                'YES',
-            ], value_input_option='RAW')
-        except Exception as e:
-            logger.error(f'Log signal failed: {e}')
+    # Signal log: fired = True, no reject reason
+    log_signal(signals_ws, today, symbol, entry_price, signal,
+               ofi_val, features_row,
+               signal_fired=True, reject_reason='NONE',
+               in_position=False)
 
     return row_id
 
@@ -858,34 +887,63 @@ def run():
     for sym, sig in sorted(signals.items(),
                             key=lambda x: x[1].get('ensemble_prob', 0),
                             reverse=True):
+
+        prob       = sig.get('ensemble_prob', 0)
+        ml_sig     = sig.get('signal', False)
+        ofi_val    = ofi_snapshots.get(sym, 0.0)
+        ofi_ok     = ofi_val > OFI_GATE
+        close_px   = float(ohlcv_data[sym]['close'].iloc[-1]) if sym in ohlcv_data else 0.0
+        feats_row  = (features_all[sym].iloc[-1]
+                      if sym in features_all else pd.Series())
+        in_pos_now = sym in active_syms
+
+        # ── Determine reject reason for signal log ────────────
         if n_open >= MAX_POSITIONS:
+            reject = 'MAX_POSITIONS'
             logger.info(f'  {sym}: max positions ({n_open}/{MAX_POSITIONS})')
+            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+                       feats_row, signal_fired=False, reject_reason=reject,
+                       in_position=in_pos_now)
             break
-        if sym in active_syms:
+
+        if in_pos_now:
+            reject = 'ALREADY_IN_POS'
             logger.info(f'  {sym}: already open — skip')
+            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+                       feats_row, signal_fired=False, reject_reason=reject,
+                       in_position=True)
             continue
+
         if sym not in ohlcv_data:
             continue
 
-        prob    = sig.get('ensemble_prob', 0)
-        ml_sig  = sig.get('signal', False)
-        ofi_val = ofi_snapshots.get(sym, 0.0)
-        ofi_ok  = ofi_val > OFI_GATE
-
         if not ml_sig:
+            reject = f'PROB_TOO_LOW_{prob:.4f}'
             logger.info(f'  {sym}: ML no signal (prob={prob:.3f})')
+            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+                       feats_row, signal_fired=False, reject_reason=reject,
+                       in_position=False)
             continue
+
         if not ofi_ok:
+            reject = f'OFI_NEGATIVE_{ofi_val:+.4f}'
             logger.info(f'  {sym}: ML signal but OFI={ofi_val:+.4f} blocked by gate')
+            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+                       feats_row, signal_fired=False, reject_reason=reject,
+                       in_position=False)
             continue
 
         # Both ML signal AND positive OFI — enter
-        entry_px   = float(ohlcv_data[sym]['close'].iloc[-1])
+        entry_px   = close_px
         trade_size = balance * RISK_PER_TRADE
 
         # FIX MINOR: minimum order check
         if trade_size < MIN_ORDER_USDT:
             logger.warning(f'  {sym}: trade_size=${trade_size:.2f} < min ${MIN_ORDER_USDT}')
+            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+                       feats_row, signal_fired=False,
+                       reject_reason='MIN_ORDER_SIZE',
+                       in_position=False)
             continue
 
         logger.info(f'  ENTRY {sym} @ {entry_px:.4f} | '
@@ -898,8 +956,6 @@ def run():
             filled = place_live_order(exchange, sym, trade_size, entry_px)
 
         if filled:
-            feats_row = (features_all[sym].iloc[-1]
-                         if sym in features_all else pd.Series())
             log_entry(trades_ws, signals_ws, today, sym,
                       entry_px, sig, ofi_val, balance, feats_row)
             n_open += 1
