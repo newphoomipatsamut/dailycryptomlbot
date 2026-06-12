@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+5-Year Walk-Forward Backtest — KrakenQuant Daily ML Bot v4
+==========================================================
+Simulates exactly what the live bot does, day by day:
+  - Same 28 features, same RF + XGB ensemble, same thresholds
+  - Same TP/SL/TRAIL_BE/MAX_HOLD position logic
+  - Model retrained on rolling TRAIN_WINDOW before each prediction
+
+Two deliberate differences from live:
+  1. OFI gate DISABLED — historical order book unavailable via free API.
+     Results are an UPPER BOUND; live may diverge by how many OFI-gated
+     trades would have failed.
+  2. FAST_MODE (default True): n_estimators=50 and retrain every 5 days.
+     Set FAST_MODE=False for exact live-equivalent (200 est., daily retrain,
+     ~4-5x slower).
+
+Runtime: ~3-8 min (FAST_MODE=True), ~20-40 min (FAST_MODE=False).
+
+Usage:
+    pip install ccxt pandas numpy scikit-learn xgboost
+    python backtest.py
+"""
+
+import json, logging, time, urllib.request
+from datetime import date as date_t, datetime, timezone
+
+import numpy as np
+import pandas as pd
+import ccxt
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+SYMBOLS           = ['ETH/USDT', 'SOL/USDT', 'LINK/USDT']
+RISK_PER_TRADE    = 0.25
+TAKE_PROFIT_PCT   = 0.030
+STOP_LOSS_PCT     = 0.010
+MAX_HOLD_DAYS     = 5
+MAX_POSITIONS     = 3
+SIGNAL_THRESHOLD  = 0.60
+BREAKEVEN_TRIGGER = 0.015
+TAKER_FEE         = 0.0026   # taker fill (post v4 fix)
+STARTING_BALANCE  = 10_000.0
+
+YEARS             = 5
+CANDLE_LIMIT      = YEARS * 366 + 30   # small buffer
+
+TRAIN_WINDOW      = 180
+MIN_WARMUP_DAYS   = 80
+
+FAST_MODE         = True   # False → exact live-equivalent (slower)
+N_EST             = 50  if FAST_MODE else 200
+RETRAIN_EVERY     = 5   if FAST_MODE else 1   # days between model retrains
+
+# ─── DATA FETCHING ────────────────────────────────────────────────────────────
+
+def fetch_ohlcv_full(exchange, symbol: str, days: int = CANDLE_LIMIT) -> pd.DataFrame:
+    """Paginate past Kraken's 720-bar limit to fetch `days` daily bars."""
+    PAGE     = 720
+    since_ms = exchange.milliseconds() - days * 86_400_000
+    all_bars: list = []
+
+    while True:
+        try:
+            bars = exchange.fetch_ohlcv(symbol, '1d', since=since_ms, limit=PAGE)
+        except Exception as e:
+            logger.warning(f'  {symbol} fetch error: {e}')
+            break
+        if not bars:
+            break
+        all_bars.extend(bars)
+        if len(bars) < PAGE:
+            break
+        since_ms = bars[-1][0] + 86_400_000   # advance past last bar
+        time.sleep(0.4)
+
+    if not all_bars:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_bars, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+    df = df.drop_duplicates('ts').sort_values('ts')
+    df['date'] = pd.to_datetime(df['ts'], unit='ms', utc=True).dt.date
+    df = df.drop('ts', axis=1).set_index('date')
+    df = df[df['close'] > 0].dropna()
+    logger.info(f'  {symbol}: {len(df)} bars  {df.index[0]} → {df.index[-1]}')
+    return df
+
+
+def fetch_fear_greed(limit: int = CANDLE_LIMIT) -> pd.Series:
+    try:
+        url = f'https://api.alternative.me/fng/?limit={limit}&format=json'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())['data']
+        records = {
+            pd.Timestamp(int(d['timestamp']), unit='s').date(): int(d['value'])
+            for d in data
+        }
+        series = pd.Series(records, name='fg').sort_index()
+        logger.info(f'  Fear & Greed: {len(series)} days  {series.index[0]} → {series.index[-1]}')
+        return series
+    except Exception as e:
+        logger.warning(f'  Fear & Greed failed ({e}) — using neutral 50')
+        return pd.Series(dtype=float, name='fg')
+
+
+# ─── FEATURE ENGINEERING (identical to live bot) ─────────────────────────────
+
+FEATURE_COLS = [
+    'ret_1d', 'ret_2d', 'ret_3d', 'ret_5d', 'ret_10d', 'ret_20d',
+    'mom_5_20', 'mom_sign',
+    'rsi', 'rsi_oversold', 'rsi_overbought',
+    'atr_pct', 'atr_pct_z', 'high_vol_regime',
+    'price_ema20_ratio', 'price_ema50_ratio', 'ema20_ema50_ratio',
+    'bb_position', 'bb_width',
+    'vol_z', 'vol_trend',
+    'hl_position', 'range_pct',
+    'dow',
+    'fg_value', 'fg_extreme_fear', 'fg_extreme_greed', 'fg_momentum',
+]
+
+
+def engineer_features(df: pd.DataFrame, fg: pd.Series) -> pd.DataFrame:
+    """
+    Precompute all features for the full OHLCV history in one pass.
+    Rolling windows look backwards only — no lookahead.
+    `fg` is the full Fear & Greed history; it is sliced by date alignment.
+    """
+    f = pd.DataFrame(index=df.index)
+
+    for n in [1, 2, 3, 5, 10, 20]:
+        f[f'ret_{n}d'] = df['close'].pct_change(n)
+
+    f['mom_5_20'] = f['ret_5d'] - f['ret_20d']
+    f['mom_sign'] = np.sign(f['ret_5d'])
+
+    delta = df['close'].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    f['rsi']           = 100 - 100 / (1 + rs)
+    f['rsi_oversold']  = (f['rsi'] < 30).astype(int)
+    f['rsi_overbought']= (f['rsi'] > 70).astype(int)
+
+    hl  = df['high'] - df['low']
+    hpc = (df['high'] - df['close'].shift()).abs()
+    lpc = (df['low']  - df['close'].shift()).abs()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+    f['atr_pct']         = atr / df['close']
+    f['atr_pct_z']       = ((f['atr_pct'] - f['atr_pct'].rolling(60).mean()) /
+                             f['atr_pct'].rolling(60).std().replace(0, np.nan))
+    f['high_vol_regime'] = (f['atr_pct'] >
+                             f['atr_pct'].rolling(60).quantile(0.75)).astype(int)
+
+    ema20 = df['close'].ewm(span=20, adjust=False).mean()
+    ema50 = df['close'].ewm(span=50, adjust=False).mean()
+    f['price_ema20_ratio'] = df['close'] / ema20 - 1
+    f['price_ema50_ratio'] = df['close'] / ema50 - 1
+    f['ema20_ema50_ratio']  = ema20 / ema50 - 1
+
+    sma20 = df['close'].rolling(20).mean()
+    std20 = df['close'].rolling(20).std()
+    upper = sma20 + 2 * std20
+    lower = sma20 - 2 * std20
+    f['bb_position'] = (df['close'] - lower) / (upper - lower + 1e-10)
+    f['bb_width']    = (upper - lower) / sma20
+
+    vol_ma  = df['volume'].rolling(20).mean()
+    vol_std = df['volume'].rolling(20).std()
+    f['vol_z']     = (df['volume'] - vol_ma) / vol_std.replace(0, np.nan)
+    f['vol_trend'] = df['volume'].pct_change(5)
+
+    f['hl_position'] = ((df['close'] - df['low']) /
+                        (df['high'] - df['low'] + 1e-10))
+    f['range_pct']   = (df['high'] - df['low']) / df['close']
+
+    f['dow'] = pd.to_datetime(f.index).dayofweek
+
+    if len(fg) > 0:
+        fg_al        = fg.reindex(pd.to_datetime(f.index).date)
+        fg_al        = fg_al.ffill().fillna(50)
+        fg_al.index  = f.index
+        f['fg_value']        = fg_al.values / 100.0
+        f['fg_extreme_fear'] = (fg_al.values <= 25).astype(int)
+        f['fg_extreme_greed']= (fg_al.values >= 75).astype(int)
+        fgs               = pd.Series(fg_al.values, index=f.index)
+        f['fg_momentum']  = fgs.diff(7) / 100.0
+    else:
+        f['fg_value'] = 0.5;  f['fg_extreme_fear'] = 0
+        f['fg_extreme_greed'] = 0;  f['fg_momentum'] = 0.0
+
+    f['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+    f['close']  = df['close']
+    f['high']   = df['high']
+    f['low']    = df['low']
+
+    return f.dropna(subset=['ret_1d', 'rsi', 'atr_pct'])
+
+
+# ─── MODEL ────────────────────────────────────────────────────────────────────
+
+def train_and_predict(features_slice: pd.DataFrame) -> dict:
+    """
+    Identical walk-forward logic to live bot:
+      validate on [-20:] holdout, then retrain on full window before predicting.
+    """
+    train_df = features_slice[features_slice['target'].notna()].copy()
+    if len(train_df) < MIN_WARMUP_DAYS:
+        return {'signal': False, 'ensemble_prob': 0.0, 'rf_prob': 0.0, 'xgb_prob': 0.0}
+
+    train_df  = train_df.tail(TRAIN_WINDOW)
+    X_all     = train_df[FEATURE_COLS].fillna(0).values
+    y_all     = train_df['target'].values
+    X_today   = features_slice[FEATURE_COLS].fillna(0).iloc[-1:].values
+
+    split    = -20
+    X_tr     = X_all[:split];  y_tr = y_all[:split]
+    X_val    = X_all[split:];  y_val = y_all[split:]
+
+    val_sc   = StandardScaler()
+    X_tr_sc  = val_sc.fit_transform(X_tr)
+    X_val_sc = val_sc.transform(X_val)
+
+    prod_sc  = StandardScaler()
+    X_all_sc = prod_sc.fit_transform(X_all)
+    X_tod_sc = prod_sc.transform(X_today)
+
+    rf = RandomForestClassifier(
+        n_estimators=N_EST, max_depth=6, min_samples_leaf=5,
+        class_weight='balanced', random_state=42, n_jobs=-1,
+    )
+    rf.fit(X_tr_sc, y_tr)
+    rf.fit(X_all_sc, y_all)
+    rf_prob = float(rf.predict_proba(X_tod_sc)[0][1])
+
+    if HAS_XGB:
+        model = XGBClassifier(
+            n_estimators=N_EST, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric='logloss', random_state=42, verbosity=0,
+        )
+    else:
+        model = GradientBoostingClassifier(
+            n_estimators=N_EST, max_depth=4, learning_rate=0.05,
+            subsample=0.8, random_state=42,
+        )
+    model.fit(X_tr_sc, y_tr)
+    model.fit(X_all_sc, y_all)
+    xgb_prob = float(model.predict_proba(X_tod_sc)[0][1])
+
+    ensemble = (rf_prob + xgb_prob) / 2
+    return {
+        'signal':       ensemble >= SIGNAL_THRESHOLD,
+        'ensemble_prob': ensemble,
+        'rf_prob':      rf_prob,
+        'xgb_prob':     xgb_prob,
+    }
+
+
+# ─── POSITION EXIT ────────────────────────────────────────────────────────────
+
+def check_exit(pos: dict, today_dt: date_t, today_row: pd.Series) -> dict | None:
+    """
+    Check one open position against today's candle.
+    Updates pos['trailing_active'] in place (checked BEFORE today's high).
+    Returns an exit dict or None (hold).
+    """
+    entry_px   = pos['entry_price']
+    entry_date = pos['entry_date']
+    hold_days  = (today_dt - entry_date).days
+
+    if hold_days == 0:
+        return None   # never exit same day as entry
+
+    daily_high = float(today_row['high'])
+    daily_low  = float(today_row['low'])
+    close_px   = float(today_row['close'])
+
+    tp_price      = entry_px * (1 + TAKE_PROFIT_PCT)
+    sl_price      = entry_px * (1 - STOP_LOSS_PCT)
+    be_trigger_px = entry_px * (1 + BREAKEVEN_TRIGGER)
+
+    trailing = pos.get('trailing_active', False)
+    effective_sl = entry_px if trailing else sl_price
+
+    tp_hit = daily_high >= tp_price
+    sl_hit = daily_low  <= effective_sl
+
+    result = None
+    if tp_hit:
+        result = {'reason': 'TP',     'exit_price': tp_price,  'pnl_pct':  TAKE_PROFIT_PCT}
+    elif sl_hit:
+        if trailing:
+            result = {'reason': 'TRAIL_BE', 'exit_price': entry_px, 'pnl_pct': 0.0}
+        else:
+            result = {'reason': 'SL',       'exit_price': sl_price,  'pnl_pct': -STOP_LOSS_PCT}
+    elif hold_days >= MAX_HOLD_DAYS:
+        pnl = (close_px - entry_px) / entry_px
+        result = {'reason': f'MAX_HOLD', 'exit_price': close_px, 'pnl_pct': pnl}
+
+    # Update trailing for future days (after exit check, so same-day logic matches live bot)
+    if daily_high >= be_trigger_px:
+        pos['trailing_active'] = True
+
+    return result
+
+
+# ─── METRICS ─────────────────────────────────────────────────────────────────
+
+def compute_metrics(trades: list[dict], equity: list[dict]) -> dict:
+    if not trades:
+        return {}
+
+    eq  = pd.DataFrame(equity).set_index('date')['balance']
+    ret = eq.pct_change().dropna()
+
+    wins  = [t for t in trades if t['win']]
+    loses = [t for t in trades if not t['win']]
+
+    total_return   = (eq.iloc[-1] / eq.iloc[0]) - 1
+    n_years        = (eq.index[-1] - eq.index[0]).days / 365.25
+    cagr           = (1 + total_return) ** (1 / n_years) - 1 if n_years > 0 else 0
+
+    rolling_max    = eq.cummax()
+    drawdowns      = (eq - rolling_max) / rolling_max
+    max_dd         = float(drawdowns.min())
+
+    sharpe         = (ret.mean() / ret.std() * np.sqrt(252)) if ret.std() > 0 else 0
+    calmar         = cagr / abs(max_dd) if max_dd != 0 else 0
+
+    avg_win        = np.mean([t['pnl_net'] for t in wins])  if wins  else 0
+    avg_loss       = np.mean([t['pnl_net'] for t in loses]) if loses else 0
+    profit_factor  = (sum(t['pnl_net'] for t in wins) /
+                      abs(sum(t['pnl_net'] for t in loses))) if loses else float('inf')
+
+    return {
+        'start_balance':  eq.iloc[0],
+        'end_balance':    eq.iloc[-1],
+        'total_return':   total_return,
+        'cagr':           cagr,
+        'max_drawdown':   max_dd,
+        'sharpe':         sharpe,
+        'calmar':         calmar,
+        'n_trades':       len(trades),
+        'win_rate':       len(wins) / len(trades),
+        'avg_win_$':      avg_win,
+        'avg_loss_$':     avg_loss,
+        'profit_factor':  profit_factor,
+        'avg_hold_days':  np.mean([t['hold_days'] for t in trades]),
+    }
+
+
+# ─── MAIN BACKTEST LOOP ───────────────────────────────────────────────────────
+
+def run_backtest():
+    logger.info('=' * 60)
+    logger.info(f'  KrakenQuant Backtest — {YEARS}yr walk-forward')
+    logger.info(f'  FAST_MODE={FAST_MODE}  n_est={N_EST}  retrain_every={RETRAIN_EVERY}d')
+    logger.info(f'  OFI gate: DISABLED (no historical book data)')
+    logger.info('=' * 60)
+
+    # ── Fetch data ────────────────────────────────────────────
+    logger.info('\nFetching OHLCV data...')
+    exchange = ccxt.kraken({'enableRateLimit': True})
+
+    ohlcv: dict[str, pd.DataFrame] = {}
+    for sym in SYMBOLS:
+        df = fetch_ohlcv_full(exchange, sym)
+        if not df.empty:
+            ohlcv[sym] = df
+
+    if not ohlcv:
+        logger.error('No data fetched — exiting.')
+        return
+
+    logger.info('\nFetching Fear & Greed history...')
+    fg = fetch_fear_greed()
+
+    # ── Precompute features (one pass per symbol, O(n)) ──────
+    logger.info('\nEngineering features...')
+    all_features: dict[str, pd.DataFrame] = {}
+    for sym, df in ohlcv.items():
+        all_features[sym] = engineer_features(df, fg)
+        logger.info(f'  {sym}: {len(all_features[sym])} feature rows')
+
+    # ── Walk-forward loop ─────────────────────────────────────
+    all_dates = sorted({d for df in ohlcv.values() for d in df.index})
+    logger.info(f'\nWalk-forward: {all_dates[0]} → {all_dates[-1]} ({len(all_dates)} days)\n')
+
+    balance     = STARTING_BALANCE
+    open_pos: dict[str, dict] = {}   # sym → position dict
+    trades: list[dict]  = []
+    equity: list[dict]  = []
+
+    # Cache last signal per symbol so we don't retrain every single day
+    sig_cache: dict[str, tuple] = {}   # sym → (last_retrain_date, signal_dict)
+
+    for d_idx, today_dt in enumerate(all_dates):
+        # ── 1. Check exits ────────────────────────────────────
+        for sym in list(open_pos.keys()):
+            if sym not in ohlcv or today_dt not in ohlcv[sym].index:
+                continue
+            row    = ohlcv[sym].loc[today_dt]
+            result = check_exit(open_pos[sym], today_dt, row)
+            if result:
+                pos        = open_pos.pop(sym)
+                trade_size = pos['trade_size']
+                pnl_gross  = result['pnl_pct'] * trade_size
+                fees       = trade_size * TAKER_FEE * 2
+                pnl_net    = pnl_gross - fees
+                balance   += pnl_net
+                trades.append({
+                    'symbol':      sym,
+                    'entry_date':  pos['entry_date'],
+                    'exit_date':   today_dt,
+                    'entry_price': pos['entry_price'],
+                    'exit_price':  result['exit_price'],
+                    'hold_days':   (today_dt - pos['entry_date']).days,
+                    'reason':      result['reason'],
+                    'trade_size':  trade_size,
+                    'pnl_gross':   round(pnl_gross, 4),
+                    'pnl_net':     round(pnl_net, 4),
+                    'fees':        round(fees, 4),
+                    'win':         pnl_net > 0,
+                    'signal_prob': pos.get('signal_prob', 0),
+                })
+
+        equity.append({'date': today_dt, 'balance': balance})
+
+        # ── 2. Generate signals and enter ─────────────────────
+        if len(open_pos) >= MAX_POSITIONS:
+            continue
+
+        candidates = []
+        for sym in SYMBOLS:
+            if sym in open_pos or sym not in all_features:
+                continue
+            feats = all_features[sym]
+            feats_slice = feats[feats.index <= today_dt]
+            if len(feats_slice) < MIN_WARMUP_DAYS:
+                continue
+
+            # Use cached signal unless it's time to retrain
+            cache = sig_cache.get(sym)
+            if cache and (today_dt - cache[0]).days < RETRAIN_EVERY:
+                sig = cache[1]
+            else:
+                sig = train_and_predict(feats_slice)
+                sig_cache[sym] = (today_dt, sig)
+
+            candidates.append((sym, sig, float(feats_slice['close'].iloc[-1])))
+
+        # Sort highest-probability first
+        candidates.sort(key=lambda x: x[1]['ensemble_prob'], reverse=True)
+
+        for sym, sig, entry_px in candidates:
+            if len(open_pos) >= MAX_POSITIONS:
+                break
+            if not sig['signal']:
+                continue
+            trade_size = balance * RISK_PER_TRADE
+            if trade_size < 15:
+                continue
+            open_pos[sym] = {
+                'entry_price':    entry_px,
+                'entry_date':     today_dt,
+                'trade_size':     trade_size,
+                'trailing_active': False,
+                'signal_prob':    sig['ensemble_prob'],
+            }
+
+        # Progress log every 180 days
+        if (d_idx + 1) % 180 == 0:
+            pct = (d_idx + 1) / len(all_dates) * 100
+            logger.info(f'  {today_dt}  bal=${balance:,.2f}  '
+                        f'trades={len(trades)}  open={len(open_pos)}  [{pct:.0f}%]')
+
+    # Close any remaining open positions at last known price
+    for sym, pos in open_pos.items():
+        if sym not in ohlcv:
+            continue
+        last_row  = ohlcv[sym].iloc[-1]
+        close_px  = float(last_row['close'])
+        pnl_pct   = (close_px - pos['entry_price']) / pos['entry_price']
+        trade_size = pos['trade_size']
+        pnl_gross  = pnl_pct * trade_size
+        fees       = trade_size * TAKER_FEE * 2
+        pnl_net    = pnl_gross - fees
+        balance   += pnl_net
+        trades.append({
+            'symbol':      sym,
+            'entry_date':  pos['entry_date'],
+            'exit_date':   all_dates[-1],
+            'entry_price': pos['entry_price'],
+            'exit_price':  close_px,
+            'hold_days':   (all_dates[-1] - pos['entry_date']).days,
+            'reason':      'FINAL_CLOSE',
+            'trade_size':  trade_size,
+            'pnl_gross':   round(pnl_gross, 4),
+            'pnl_net':     round(pnl_net, 4),
+            'fees':        round(fees, 4),
+            'win':         pnl_net > 0,
+            'signal_prob': pos.get('signal_prob', 0),
+        })
+
+    # ── Results ───────────────────────────────────────────────
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(equity)
+
+    trades_df.to_csv('backtest_trades.csv', index=False)
+    equity_df.to_csv('backtest_equity.csv', index=False)
+    logger.info('\nSaved backtest_trades.csv and backtest_equity.csv')
+
+    m = compute_metrics(trades, equity)
+    if not m:
+        logger.info('No trades generated.')
+        return
+
+    print('\n' + '=' * 55)
+    print(f'  BACKTEST RESULTS  ({all_dates[0]} → {all_dates[-1]})')
+    print('=' * 55)
+    print(f'  Starting balance   ${m["start_balance"]:>10,.2f}')
+    print(f'  Ending balance     ${m["end_balance"]:>10,.2f}')
+    print(f'  Total return       {m["total_return"]*100:>10.1f}%')
+    print(f'  CAGR               {m["cagr"]*100:>10.1f}%')
+    print(f'  Max drawdown       {m["max_drawdown"]*100:>10.1f}%')
+    print(f'  Sharpe (ann.)      {m["sharpe"]:>10.2f}')
+    print(f'  Calmar             {m["calmar"]:>10.2f}')
+    print('-' * 55)
+    print(f'  Total trades       {m["n_trades"]:>10}')
+    print(f'  Win rate           {m["win_rate"]*100:>10.1f}%')
+    print(f'  Avg win            ${m["avg_win_$"]:>10.2f}')
+    print(f'  Avg loss           ${m["avg_loss_$"]:>10.2f}')
+    print(f'  Profit factor      {m["profit_factor"]:>10.2f}')
+    print(f'  Avg hold days      {m["avg_hold_days"]:>10.1f}')
+    print('-' * 55)
+
+    if not trades_df.empty:
+        print('\n  Per-symbol breakdown:')
+        for sym in SYMBOLS:
+            st = trades_df[trades_df['symbol'] == sym]
+            if st.empty:
+                print(f'    {sym:<12}  no trades')
+                continue
+            wr  = st['win'].mean() * 100
+            pnl = st['pnl_net'].sum()
+            n   = len(st)
+            print(f'    {sym:<12}  {n:>3} trades  win={wr:.0f}%  net PnL=${pnl:+.2f}')
+
+    print('\n  Exit reason breakdown:')
+    for reason, grp in trades_df.groupby('reason'):
+        net = grp['pnl_net'].sum()
+        print(f'    {reason:<14}  {len(grp):>3}x  net=${net:+.2f}')
+
+    print('\n  NOTE: OFI gate disabled — upper-bound estimate.')
+    if FAST_MODE:
+        print('  NOTE: FAST_MODE on (n_est=50, retrain every 5d).')
+        print('        Run with FAST_MODE=False for exact live-equivalent.')
+    print('=' * 55 + '\n')
+
+
+if __name__ == '__main__':
+    run_backtest()
