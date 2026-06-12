@@ -14,13 +14,19 @@ v3 additions (Fear & Greed + BTC Dominance):
             fg_value, fg_extreme_fear, fg_extreme_greed, fg_momentum
             Extreme fear historically = strong mean-reversion buy signal
             Extreme greed = weak entry conditions
-  [FEATURE] BTC Dominance (CoinGecko, free)
-            btc_dom, btc_dom_rising, btc_dom_high
-            Rising dominance = capital leaving alts → avoid entry
-            Falling dominance = alt season → favourable entry
-  [CONFIG]  RISK_PER_TRADE raised 10% → 15% (validated by backtest)
+  [CONFIG]  RISK_PER_TRADE = 25% (confirmed by fee math on live runs)
   [CONFIG]  MAX_POSITIONS raised 2 → 3 (one per symbol)
-  Both APIs fetched once per run and cached — no extra latency per symbol
+  Fear & Greed fetched once per run and cached — no extra latency per symbol
+
+v4 fixes (from audit):
+  [BUG 1] Stale model: was trained on [-180:-20], predicted with 20-day-old params.
+          Now retrains on full TRAIN_WINDOW before predicting today.
+  [BUG 2] Trade size at exit used current balance, not entry balance — PnL drift.
+          trade_size now stored in DailyTrades col Q and retrieved on close.
+  [RISK]  Live order was post-only (maker). Removed oflags:post — now fills as
+          taker on breakouts instead of being rejected at the worst moment.
+  [MINOR] Removed dead btc_dom feature computation (excluded from FEATURE_COLS).
+  [MINOR] Added candle-timing diagnostic log to catch partial-bar train/serve skew.
 
 v2 fixes (from audit):
   [BUG 1] Balance persistence: stored in Sheets DailyMeta tab
@@ -39,7 +45,7 @@ Strategy:
   - TP=3% (vs daily HIGH), SL=1% (vs daily LOW), max hold 5 days
 
 Position sizing:
-  - Trade size: 15% of balance per signal
+  - Trade size: 25% of balance per signal
   - Max 3 concurrent positions (one per symbol)
   - TP: 3%  SL: 1%  Max hold: 5 days
   - Estimated annual return: ~31-33%
@@ -134,11 +140,11 @@ def init_sheets():
                 ws.append_row(headers)
                 return ws
 
-        trades_ws  = get_or_create('DailyTrades', 5000, 16, [
+        trades_ws  = get_or_create('DailyTrades', 5000, 17, [
             'row_id', 'date', 'symbol', 'action', 'entry_price', 'exit_price',
             'pnl_gross', 'pnl_net', 'fees', 'reason',
             'hold_days', 'win', 'balance_after',
-            'signal_prob', 'rf_prob', 'xgb_prob',
+            'signal_prob', 'rf_prob', 'xgb_prob', 'trade_size',
         ])
         signals_ws = get_or_create('DailySignals', 50000, 13, [
             'date', 'symbol', 'close', 'ensemble_prob', 'rf_prob', 'xgb_prob',
@@ -213,7 +219,12 @@ def fetch_ohlcv(exchange, symbol: str, limit: int = CANDLE_LIMIT) -> pd.DataFram
             logger.warning(f'  {symbol}: only {len(df)} bars, need {MIN_WARMUP_DAYS} — skip')
             return pd.DataFrame()
 
-        logger.info(f'  {symbol}: {len(df)} daily candles ({df.index[0]} → {df.index[-1]})')
+        run_date = datetime.now(timezone.utc).date()
+        last_candle = df.index[-1]
+        skew_note = ('partial bar' if last_candle >= run_date
+                     else 'complete bar')
+        logger.info(f'  {symbol}: {len(df)} daily candles ({df.index[0]} → {last_candle}) '
+                    f'[last={skew_note}, run={run_date}]')
         return df
     except Exception as e:
         logger.error(f'OHLCV fetch failed {symbol}: {e}')
@@ -281,12 +292,9 @@ def get_fear_greed() -> pd.Series:
     return _FG_CACHE
 
 
-def engineer_features(df: pd.DataFrame,
-                      btc_df: pd.DataFrame = None) -> pd.DataFrame:
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build 31 features from daily OHLCV + sentiment + BTC relative strength.
-    btc_df: BTC/USDT OHLCV (already fetched) — used for BTC rel-strength proxy.
-            Pass None when evaluating BTC itself (features fall back to 0).
+    Build 28 features from daily OHLCV + Fear & Greed sentiment.
     OFI is NOT a feature here — it's used as an entry gate in run().
     Target: next-day close > today's close (binary).
     """
@@ -373,27 +381,6 @@ def engineer_features(df: pd.DataFrame,
         f['fg_extreme_greed'] = 0
         f['fg_momentum']      = 0.0
 
-    # ── BTC Relative Strength (dominance proxy) ───────────────
-    # CoinGecko dominance API now requires auth — replaced with a
-    # self-contained proxy: BTC 20-day return vs this symbol's 20-day return.
-    # When BTC is strongly outperforming, capital is rotating into BTC
-    # (rising dominance effect) → weaker environment for alts.
-    # btc_df is passed in by run() from already-fetched BTC/USDT OHLCV.
-    # Falls back to neutral zeros if BTC data unavailable (e.g. BTC is
-    # the symbol being evaluated).
-    if btc_df is not None and len(btc_df) > 0:
-        btc_ret20 = btc_df['close'].pct_change(20).reindex(df.index)
-        sym_ret20 = df['close'].pct_change(20)
-        rel_str   = sym_ret20 - btc_ret20            # positive = alt outperforming
-        f['btc_dom']        = rel_str.fillna(0)      # renamed: now means alt vs BTC
-        dom_series          = pd.Series(rel_str.values, index=f.index)
-        f['btc_dom_rising'] = (btc_ret20.fillna(0) > sym_ret20.fillna(0)).astype(int)
-        f['btc_dom_high']   = (btc_ret20.fillna(0) > 0.10).astype(int)  # BTC up >10%
-    else:
-        f['btc_dom']        = 0.0
-        f['btc_dom_rising'] = 0
-        f['btc_dom_high']   = 0
-
     # ── Target: next day close > today's close ────────────────
     f['target'] = (df['close'].shift(-1) > df['close']).astype(int)
 
@@ -447,15 +434,21 @@ def train_and_predict(features_df: pd.DataFrame) -> dict:
     # Today — last row, no target
     X_today = df[FEATURE_COLS].fillna(0).iloc[-1:].values
 
-    # Walk-forward split — always 20-day validation window
+    # Walk-forward split — 20-day holdout used for val_acc only
     split    = -20
     X_tr     = X_all[:split];   y_tr = y_all[:split]
     X_val    = X_all[split:];   y_val= y_all[split:]
 
-    scaler   = StandardScaler()
-    X_tr_sc  = scaler.fit_transform(X_tr)
-    X_val_sc = scaler.transform(X_val)
-    X_tod_sc = scaler.transform(X_today)
+    # Validation scaler — fit on training split only
+    val_scaler   = StandardScaler()
+    X_tr_sc      = val_scaler.fit_transform(X_tr)
+    X_val_sc     = val_scaler.transform(X_val)
+
+    # Production scaler — refit on full window so the live prediction
+    # sees the most recent 20 bars in both training and scaling context.
+    prod_scaler  = StandardScaler()
+    X_all_sc     = prod_scaler.fit_transform(X_all)
+    X_tod_sc     = prod_scaler.transform(X_today)
 
     # ── Random Forest ─────────────────────────────────────────
     rf = RandomForestClassifier(
@@ -463,7 +456,8 @@ def train_and_predict(features_df: pd.DataFrame) -> dict:
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
     rf.fit(X_tr_sc, y_tr)
-    rf_acc  = accuracy_score(y_val, rf.predict(X_val_sc))
+    rf_acc = accuracy_score(y_val, rf.predict(X_val_sc))
+    rf.fit(X_all_sc, y_all)                          # retrain on full window
     rf_prob = float(rf.predict_proba(X_tod_sc)[0][1])
 
     # ── XGBoost / GradientBoosting fallback ───────────────────
@@ -479,7 +473,8 @@ def train_and_predict(features_df: pd.DataFrame) -> dict:
             subsample=0.8, random_state=42,
         )
     model.fit(X_tr_sc, y_tr)
-    xgb_acc  = accuracy_score(y_val, model.predict(X_val_sc))
+    xgb_acc = accuracy_score(y_val, model.predict(X_val_sc))
+    model.fit(X_all_sc, y_all)                       # retrain on full window
     xgb_prob = float(model.predict_proba(X_tod_sc)[0][1])
 
     ensemble = (rf_prob + xgb_prob) / 2
@@ -690,7 +685,7 @@ def log_signal(signals_ws, today: str, symbol: str,
 def log_entry(trades_ws, signals_ws, today: str, symbol: str,
               entry_price: float, signal: dict,
               ofi_val: float, balance: float,
-              features_row: pd.Series) -> str:
+              features_row: pd.Series, trade_size: float) -> str:
     """Log new trade entry to DailyTrades. Returns row_id for later exit update."""
     row_id = _next_row_id(trades_ws) if trades_ws else 'T0000'
 
@@ -704,6 +699,7 @@ def log_entry(trades_ws, signals_ws, today: str, symbol: str,
                 round(signal['ensemble_prob'], 4),
                 round(signal['rf_prob'], 4),
                 round(signal['xgb_prob'], 4),
+                round(trade_size, 4),             # col Q — used by log_exit
             ], value_input_option='RAW')
         except Exception as e:
             logger.error(f'Log entry failed: {e}')
@@ -719,9 +715,11 @@ def log_entry(trades_ws, signals_ws, today: str, symbol: str,
 def log_exit(trades_ws, pos: dict, balance: float) -> float:
     """
     Log trade exit. Returns updated balance.
-    FIX MINOR: matches by row_id (column A) not date+symbol.
+    Uses trade_size stored at entry (col Q) so PnL is calculated on the
+    actual allocated amount, not the current balance.
     """
-    trade_size = balance * RISK_PER_TRADE
+    stored = pos.get('trade_size', '')
+    trade_size = float(stored) if stored else balance * RISK_PER_TRADE
     pnl_gross  = pos['pnl_pct'] * trade_size
     fees       = trade_size * MAKER_FEE * 2
     pnl_net    = pnl_gross - fees
@@ -747,7 +745,7 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                     and not row[5]
                 )
                 if match:
-                    trades_ws.update(f'A{i+1}:P{i+1}', [[
+                    trades_ws.update(f'A{i+1}:Q{i+1}', [[
                         row[0],                               # row_id preserved
                         pos['date'], pos['symbol'], 'CLOSED',
                         round(float(pos['entry_price']), 6),
@@ -758,6 +756,7 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                         row[13] if len(row) > 13 else '',
                         row[14] if len(row) > 14 else '',
                         row[15] if len(row) > 15 else '',
+                        row[16] if len(row) > 16 else round(trade_size, 4),
                     ]])
                     break
         except Exception as e:
@@ -771,15 +770,16 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
 def place_live_order(exchange, symbol: str, trade_size: float,
                      entry_px: float) -> bool:
     """
-    FIX RISK: place limit buy with 60s fill timeout.
+    Place limit buy with 60s fill timeout. No post-only flag so the order
+    fills immediately as a taker if price has moved — avoids being rejected
+    on the breakouts where the ML signal fires.
     Returns True if filled, False otherwise.
     """
     import time
     try:
         qty   = trade_size / entry_px
         order = exchange.create_limit_buy_order(
-            symbol, qty, entry_px,
-            params={'oflags': 'post'}   # maker only
+            symbol, qty, entry_px   # no oflags:post — taker fill allowed
         )
         order_id = order['id']
         logger.info(f'  Order placed: {order_id} | {qty:.6f} {symbol} @ {entry_px}')
@@ -812,7 +812,7 @@ def run():
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
     logger.info('=' * 60)
-    logger.info(f'  KrakenQuant Daily ML v2 — {today}')
+    logger.info(f'  KrakenQuant Daily ML v4 — {today}')
     logger.info(f'  Mode    : {"PAPER" if PAPER_MODE else "LIVE"}')
     logger.info(f'  XGBoost : {"yes" if HAS_XGB else "GradientBoosting fallback"}')
     logger.info(f'  Symbols : {SYMBOLS}')
@@ -876,9 +876,7 @@ def run():
 
     for sym, df in ohlcv_data.items():
         logger.info(f'\n  {sym}:')
-        # Pass btc_df=None if sym IS BTC (avoid self-comparison)
-        _btc = None if sym == 'BTC/USDT' else btc_df
-        feats             = engineer_features(df, btc_df=_btc)
+        feats             = engineer_features(df)
         features_all[sym] = feats
         signals[sym]      = train_and_predict(feats)
 
@@ -957,7 +955,7 @@ def run():
 
         if filled:
             log_entry(trades_ws, signals_ws, today, sym,
-                      entry_px, sig, ofi_val, balance, feats_row)
+                      entry_px, sig, ofi_val, balance, feats_row, trade_size)
             n_open += 1
             active_syms.add(sym)
 
