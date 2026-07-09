@@ -15,6 +15,10 @@ Two deliberate differences from live:
      Set FAST_MODE=False for exact live-equivalent (200 est., daily retrain,
      ~4-5x slower).
 
+Data span: YEARS=5 is requested but Kraken only lists ETH/SOL/LINK-USDT
+from 2024-07-19 — confirmed via fetch_ohlcv(since=6y ago), not a pagination
+bug. Actual backtest window is ~2 years regardless of YEARS.
+
 Runtime: ~3-8 min (FAST_MODE=True), ~20-40 min (FAST_MODE=False).
 
 Usage:
@@ -219,7 +223,10 @@ def train_and_predict(features_slice: pd.DataFrame) -> dict:
     Identical walk-forward logic to live bot:
       validate on [-20:] holdout, then retrain on full window before predicting.
     """
-    train_df = features_slice[features_slice['target'].notna()].copy()
+    # Exclude the last row (today) from training. In live, today's target is NaN
+    # because tomorrow hasn't happened. Here features were precomputed on the full
+    # dataset so today's target is NOT NaN — including it would be lookahead bias.
+    train_df = features_slice.iloc[:-1][features_slice.iloc[:-1]['target'].notna()].copy()
     if len(train_df) < MIN_WARMUP_DAYS:
         return {'signal': False, 'ensemble_prob': 0.0, 'rf_prob': 0.0, 'xgb_prob': 0.0}
 

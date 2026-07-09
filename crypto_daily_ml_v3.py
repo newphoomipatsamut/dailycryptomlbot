@@ -40,7 +40,7 @@ Strategy:
   - Fetches 365 days of OHLCV from Kraken
   - Fetches Fear & Greed history + BTC dominance (once per run)
   - Takes daily OFI snapshot — used as entry gate, not model feature
-  - Engineers 31 features (24 technical + 7 sentiment/macro)
+  - Engineers 28 features (24 technical + 4 sentiment)
   - RF + XGB ensemble: enter if P(up) > 0.60 AND OFI > 0
   - TP=3% (vs daily HIGH), SL=1% (vs daily LOW), max hold 5 days
 
@@ -48,7 +48,11 @@ Position sizing:
   - Trade size: 25% of balance per signal
   - Max 3 concurrent positions (one per symbol)
   - TP: 3%  SL: 1%  Max hold: 5 days
-  - Estimated annual return: ~31-33%
+
+See backtest.py for measured performance (~10.4% CAGR over the ~2yr history
+Kraken has for these USDT pairs, OFI gate disabled — an upper-bound estimate,
+not a live-equivalent number). Treat any "expected return" figure as
+unverified until backed by a FAST_MODE=False backtest run.
 
 Setup:
   pip install ccxt pandas numpy scikit-learn xgboost gspread google-auth
@@ -105,7 +109,8 @@ OFI_GATE         = 0.0           # OFI snapshot must be > this to allow entry
                                  # (positive = buy pressure in order book)
 BREAKEVEN_TRIGGER= 0.015         # once position up 1.5%, SL moves to breakeven
                                  # protects profits without widening initial SL
-MAKER_FEE        = 0.0016
+TAKER_FEE        = 0.0026        # v4 removed post-only (oflags:post), so entry
+                                 # fills as taker, not maker — fee must match
 MIN_ORDER_USDT   = 15.0          # Kraken minimum order value
 
 TRAIN_WINDOW     = 180
@@ -721,7 +726,7 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
     stored = pos.get('trade_size', '')
     trade_size = float(stored) if stored else balance * RISK_PER_TRADE
     pnl_gross  = pos['pnl_pct'] * trade_size
-    fees       = trade_size * MAKER_FEE * 2
+    fees       = trade_size * TAKER_FEE * 2
     pnl_net    = pnl_gross - fees
     win        = pnl_net > 0
     new_bal    = balance + pnl_net
