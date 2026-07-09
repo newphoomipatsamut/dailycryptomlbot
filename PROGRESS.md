@@ -5,6 +5,71 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-09 (session 4) — Fixed the same bug in the LIVE bot, refreshed all backtest numbers
+
+Session 3 found and fixed the entry-day trailing-stop bug in `backtest.py`
+only. This session found and fixed the **same underlying issue in the live
+bot itself** (`crypto_daily_ml_v3.py`), which is worse there, then
+refreshed every stale backtest number from session 2/3 now that the fix is
+in.
+
+**Live bug (`crypto_daily_ml_v3.py::check_exits()`), pushed as `6d31c71`:**
+GitHub Actions scheduled runs land ~4hrs into the UTC day on average
+(measured across all 119 scheduled runs: range 2.9-6.3h, **never** close
+to the scheduled 00:05 UTC — this is GitHub Actions' well-documented
+unreliable scheduling, not a bot bug). So every single day, `check_exits()`
+was checking TP/SL against a bar that's on average only ~18% complete.
+Two real consequences:
+1. **Delayed detection** — a real SL/TP hit that happens after the check
+   isn't caught until the next day, which can flip the recorded outcome
+   (this is the exact SOL 2026-04-28 case from session 3: a real SL
+   breach got misrecorded as a `TRAIL_BE` save).
+2. **Fully missed exits** (structural, can't be quantified from sheet data
+   alone) — if price hits TP/SL after the check and reverses back inside
+   the range before the next day's check, that hit is never detected at
+   all; the position just keeps holding.
+
+Fix: `check_exits()` now evaluates the most recently **complete** daily
+bar (yesterday relative to the run) instead of today's partial one. Entry
+price and signal generation are unchanged — this only changes exit
+evaluation. Verified against all 8 known real trades: 7/8 unaffected
+(identical outcome), and the 1 known-buggy case (SOL 2026-04-28) now
+correctly resolves to `SL` instead of the erroneous `TRAIL_BE` — exactly
+the failure mode being fixed. Confirmed clean on a live `workflow_dispatch`
+run afterward, no errors.
+
+**Refreshed backtest numbers** (session 2/3's tables were stale — this is
+current as of the `backtest.py` entry-day fix, before this session's fix
+existed in `backtest.py`'s own logic since that was already fixed in
+session 3):
+
+| Config | CAGR (pre both fixes) | CAGR (post backtest.py fix) | Sharpe | Trades | Win Rate |
+|---|---:|---:|---:|---:|---:|
+| Kraken ~2yr, FAST_MODE=True | 10.4% | 14.5% | 1.94 | 335 | 34.9% |
+| Kraken ~2yr, FAST_MODE=False (exact) | 7.5% | **25.0%** | 2.61 | 460 | 37.6% |
+| Binance 8yr, OFI proxy off | 24.6% | 43.5% | 4.31 | 1565 | 47.7% |
+| Binance 8yr, OFI proxy on | 7.6% | 12.5% | 2.35 | 615 | 46.5% |
+
+**Read this caveat before quoting any of these numbers elsewhere:** the
+`backtest.py` fix didn't change the strategy — it corrected bookkeeping
+(fewer trades wrongly marked as full stop-losses instead of breakeven
+saves). At `RISK_PER_TRADE=0.25` compounded over hundreds-to-thousands of
+trades across years, even a small per-trade bookkeeping correction
+amplifies enormously (Binance-no-OFI Sharpe alone went 2.33→4.31). Treat
+the *direction* (all four went up) as trustworthy; do not treat the exact
+magnitudes as a real expected-return estimate. This is also a reminder
+that 25% position sizing makes every backtest number extremely sensitive
+to small mechanical details — worth remembering before ever scaling this
+with real capital.
+
+**Explicitly not done:** did not touch strategy/thresholds/features. Did
+not re-run `analyze_live_ofi.py` (n is still 20, unchanged this session —
+that finding is untouched by either fix since it derives its OFI-blocked
+outcomes from the same corrected `check_exit()` logic backtest.py already
+had in session 3).
+
+---
+
 ## 2026-07-09 (session 3) — Real live OFI answer, a genuine backtest bug fixed, tracking tool added
 
 User asked to check the live `DailySignals`/`DailyTrades` Google Sheet (no
@@ -250,27 +315,20 @@ caveat resolved first (see Open Items).
   that as a hint, not a conclusion, until n is much larger). Needs fresh
   `DailySignals`/`DailyTrades` CSV exports each time (see script docstring
   for why — no local API access to the sheet).
-- **Session-2's four-config comparison table (Kraken/Binance x OFI on/off)
-  is now stale** post the session-3 trailing-stop bug fix. Not fully
-  rerun this session. Regenerate if a fresh number set matters:
-  `DATA_SOURCE=binance|kraken OFI_GATE_ENABLED=true|false python3
-  backtest.py`, 4 runs, several minutes to ~an hour total.
-- **`FAST_MODE=False` on the full Binance 8yr history never run.** All
-  Binance numbers so far are FAST_MODE=True (n_est=50, retrain every 5d).
-  Would likely take multiple hours — worth doing before any real-money
+- **Four-config comparison table refreshed in session 4** (see above) —
+  no longer stale as of 2026-07-09. `FAST_MODE=False` on the full Binance
+  8yr history is still never run (all Binance numbers are FAST_MODE=True);
+  would likely take multiple hours — worth doing before any real-money
   decision, not before.
 - **Whether to act on either OFI finding** — e.g. reconsidering
   `OFI_GATE` threshold or gate design in the live bot — is a strategy
-  decision, explicitly not made this session. Ask the user, and only once
-  n is large enough to mean something.
-- **Live's daily exit check runs against a partial "today" bar** (cron
-  lands ~4hr into the UTC day, not exactly the scheduled 00:05) — a
-  same-day SL/TP breach after that check isn't caught until the next
-  day's run. Documented as a known live-only behavior in session 3, not
-  fixed (nothing to fix — it's inherent to checking once/day against a
-  still-forming bar; would need intraday checks to close, which is a much
-  bigger change). Worth knowing about if a live outcome ever looks
-  surprising vs. what the backtest would have predicted.
+  decision, explicitly not made. Ask the user, and only once n is large
+  enough to mean something.
+- **Live's partial-bar exit-check timing bug is FIXED as of session 4**
+  (`6d31c71`) — `check_exits()` now uses the most recently complete daily
+  bar. If a live outcome ever looks surprising vs. what the backtest
+  predicts going forward, this is no longer the likely cause; look
+  elsewhere first.
 - **Node.js 20 deprecation warning in Actions logs** (from
   `actions/checkout@v3` / `actions/setup-python@v4`) — unrelated to bot
   code, cosmetic, not fixed. Bump to `@v4`/`@v5` if it starts actually
