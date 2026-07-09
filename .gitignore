@@ -1,4 +1,4 @@
-backtest_trades.csv
-backtest_equity.csv
+backtest_trades*.csv
+backtest_equity*.csv
 __pycache__/
 *.pyc

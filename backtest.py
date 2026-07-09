@@ -7,26 +7,42 @@ Simulates exactly what the live bot does, day by day:
   - Same TP/SL/TRAIL_BE/MAX_HOLD position logic
   - Model retrained on rolling TRAIN_WINDOW before each prediction
 
-Two deliberate differences from live:
-  1. OFI gate DISABLED — historical order book unavailable via free API.
-     Results are an UPPER BOUND; live may diverge by how many OFI-gated
-     trades would have failed.
+Deliberate differences from live:
+  1. OFI gate: live uses an intraday order-book depth snapshot (OBI) as an
+     entry gate. No free API provides historical order-book snapshots, so
+     that exact signal can't be backtested. OFI_GATE_ENABLED (default
+     False) instead gates on a PROXY: daily aggressor trade-flow imbalance
+     `(2*taker_buy_vol - total_vol) / total_vol`, built from Binance kline
+     data (taker_buy_base_asset_volume field). Same [-1,+1] convention,
+     positive = buy pressure, but it's a different construction (full-day
+     trade flow vs. an order-book depth snapshot) — treat results with the
+     gate ON as informative, not equivalent to what live's OFI gate would
+     have produced.
   2. FAST_MODE (default True): n_estimators=50 and retrain every 5 days.
      Set FAST_MODE=False for exact live-equivalent (200 est., daily retrain,
-     ~4-5x slower).
+     ~4-5x slower — can be hours at DATA_SOURCE=binance's longer history).
+  3. DATA_SOURCE (default 'binance'): live trades on Kraken, but Kraken's
+     public OHLC REST endpoint hard-caps at 720 daily bars *regardless of
+     the `since` param* — confirmed by requesting BTC/USD (listed on
+     Kraken since 2013) at since=8y-ago and still getting only the most
+     recent 720 bars. That's an API retention cap, not a listing-date
+     limit (an earlier version of this comment claimed the latter —
+     wrong). Binance has genuinely deeper public history for the same
+     pairs (ETH from 2018, LINK from 2019, SOL from 2020 — SOL's actual
+     listing date is the binding constraint, not an API cap) and is used
+     here as a research-only price source. Set DATA_SOURCE='kraken' to
+     backtest strictly on the live execution venue's ~2yr window instead.
 
-Data span: YEARS=5 is requested but Kraken only lists ETH/SOL/LINK-USDT
-from 2024-07-19 — confirmed via fetch_ohlcv(since=6y ago), not a pagination
-bug. Actual backtest window is ~2 years regardless of YEARS.
-
-Runtime: ~3-8 min (FAST_MODE=True), ~20-40 min (FAST_MODE=False).
+Runtime: ~3-8 min (FAST_MODE=True, ~2yr Kraken), scales up with history
+length and OFI fetch overhead; can be 30+ min on Binance's full range.
 
 Usage:
     pip install ccxt pandas numpy scikit-learn xgboost
     python backtest.py
+    DATA_SOURCE=kraken OFI_GATE_ENABLED=true python backtest.py
 """
 
-import json, logging, time, urllib.request
+import json, logging, os, time, urllib.request
 from datetime import date as date_t, datetime, timezone
 
 import numpy as np
@@ -58,9 +74,17 @@ MAX_POSITIONS     = 3
 SIGNAL_THRESHOLD  = 0.60
 BREAKEVEN_TRIGGER = 0.015
 TAKER_FEE         = 0.0026   # taker fill (post v4 fix)
+OFI_GATE          = 0.0      # matches live's OFI_GATE — proxy must be > this
 STARTING_BALANCE  = 10_000.0
 
-YEARS             = 5
+# 'binance' = deep history, research-only (live trades on Kraken).
+# 'kraken'  = live's actual venue, capped at ~720 daily bars by the API.
+DATA_SOURCE       = os.environ.get('DATA_SOURCE', 'binance').lower()
+
+# Proxy trade-flow-imbalance gate (Binance-only — see module docstring).
+OFI_GATE_ENABLED  = os.environ.get('OFI_GATE_ENABLED', 'false').lower() == 'true'
+
+YEARS             = 8   # request all available; each source/symbol returns what it has
 CANDLE_LIMIT      = YEARS * 366 + 30   # small buffer
 
 TRAIN_WINDOW      = 180
@@ -73,7 +97,12 @@ RETRAIN_EVERY     = 5   if FAST_MODE else 1   # days between model retrains
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
 
 def fetch_ohlcv_full(exchange, symbol: str, days: int = CANDLE_LIMIT) -> pd.DataFrame:
-    """Paginate past Kraken's 720-bar limit to fetch `days` daily bars."""
+    """
+    Paginate in 720-bar pages to fetch up to `days` daily bars.
+    Effective on Binance (since= is honored, pagination reaches deep history).
+    On Kraken, since= is capped server-side at ~720 most-recent bars no
+    matter the value passed — the loop just returns a single page there.
+    """
     PAGE     = 720
     since_ms = exchange.milliseconds() - days * 86_400_000
     all_bars: list = []
@@ -120,6 +149,55 @@ def fetch_fear_greed(limit: int = CANDLE_LIMIT) -> pd.Series:
     except Exception as e:
         logger.warning(f'  Fear & Greed failed ({e}) — using neutral 50')
         return pd.Series(dtype=float, name='fg')
+
+
+def fetch_taker_buy_ratio(binance_exchange, symbol: str, days: int) -> pd.Series:
+    """
+    Daily proxy for order-flow imbalance, built from Binance's raw kline
+    field taker_buy_base_asset_volume (aggressive/taker BUY volume for the
+    day). Value = (2*taker_buy_vol - total_vol) / total_vol, in [-1, +1],
+    positive = buy pressure — same convention as the live bot's order-book
+    OBI, but a different metric (day's aggregate trade flow, not an
+    order-book depth snapshot). See module docstring for the caveat.
+    Always queries Binance directly (raw REST via ccxt's binance client),
+    regardless of DATA_SOURCE, since Kraken's OHLC data doesn't expose
+    this split.
+    """
+    try:
+        market_id = binance_exchange.market(symbol)['id']   # e.g. 'ETHUSDT'
+    except Exception as e:
+        logger.warning(f'  {symbol}: no Binance market for OFI proxy ({e})')
+        return pd.Series(dtype=float)
+
+    since_ms = binance_exchange.milliseconds() - days * 86_400_000
+    records  = {}
+    while True:
+        try:
+            raw = binance_exchange.publicGetKlines({
+                'symbol': market_id, 'interval': '1d',
+                'startTime': since_ms, 'limit': 1000,
+            })
+        except Exception as e:
+            logger.warning(f'  {symbol}: OFI proxy fetch error ({e})')
+            break
+        if not raw:
+            break
+        for row in raw:
+            d         = pd.Timestamp(int(row[0]), unit='ms', tz='UTC').date()
+            total_vol = float(row[5])
+            taker_buy = float(row[9])
+            if total_vol > 0:
+                records[d] = (2 * taker_buy - total_vol) / total_vol
+        if len(raw) < 1000:
+            break
+        since_ms = int(raw[-1][0]) + 86_400_000
+        time.sleep(0.2)
+
+    series = pd.Series(records, name='ofi_proxy').sort_index()
+    if len(series) > 0:
+        logger.info(f'  {symbol}: OFI proxy {len(series)} days '
+                    f'{series.index[0]} → {series.index[-1]}')
+    return series
 
 
 # ─── FEATURE ENGINEERING (identical to live bot) ─────────────────────────────
@@ -377,13 +455,15 @@ def compute_metrics(trades: list[dict], equity: list[dict]) -> dict:
 def run_backtest():
     logger.info('=' * 60)
     logger.info(f'  KrakenQuant Backtest — {YEARS}yr walk-forward')
-    logger.info(f'  FAST_MODE={FAST_MODE}  n_est={N_EST}  retrain_every={RETRAIN_EVERY}d')
-    logger.info(f'  OFI gate: DISABLED (no historical book data)')
+    logger.info(f'  DATA_SOURCE={DATA_SOURCE}  FAST_MODE={FAST_MODE}  '
+                f'n_est={N_EST}  retrain_every={RETRAIN_EVERY}d')
+    logger.info(f'  OFI gate: {"ENABLED (Binance taker-buy proxy)" if OFI_GATE_ENABLED else "DISABLED"}')
     logger.info('=' * 60)
 
     # ── Fetch data ────────────────────────────────────────────
     logger.info('\nFetching OHLCV data...')
-    exchange = ccxt.kraken({'enableRateLimit': True})
+    exchange = ccxt.binance({'enableRateLimit': True}) if DATA_SOURCE == 'binance' \
+               else ccxt.kraken({'enableRateLimit': True})
 
     ohlcv: dict[str, pd.DataFrame] = {}
     for sym in SYMBOLS:
@@ -397,6 +477,14 @@ def run_backtest():
 
     logger.info('\nFetching Fear & Greed history...')
     fg = fetch_fear_greed()
+
+    ofi_series: dict[str, pd.Series] = {}
+    if OFI_GATE_ENABLED:
+        logger.info('\nFetching OFI proxy (Binance taker-buy volume)...')
+        binance_ex = exchange if DATA_SOURCE == 'binance' \
+                     else ccxt.binance({'enableRateLimit': True})
+        for sym in SYMBOLS:
+            ofi_series[sym] = fetch_taker_buy_ratio(binance_ex, sym, CANDLE_LIMIT)
 
     # ── Precompute features (one pass per symbol, O(n)) ──────
     logger.info('\nEngineering features...')
@@ -480,6 +568,10 @@ def run_backtest():
                 break
             if not sig['signal']:
                 continue
+            if OFI_GATE_ENABLED:
+                ofi_today = ofi_series.get(sym, pd.Series()).get(today_dt, 0.0)
+                if ofi_today <= OFI_GATE:
+                    continue
             trade_size = balance * RISK_PER_TRADE
             if trade_size < 15:
                 continue
@@ -529,9 +621,12 @@ def run_backtest():
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity)
 
-    trades_df.to_csv('backtest_trades.csv', index=False)
-    equity_df.to_csv('backtest_equity.csv', index=False)
-    logger.info('\nSaved backtest_trades.csv and backtest_equity.csv')
+    suffix = f'{DATA_SOURCE}{"_ofi" if OFI_GATE_ENABLED else ""}'
+    trades_file = f'backtest_trades_{suffix}.csv'
+    equity_file = f'backtest_equity_{suffix}.csv'
+    trades_df.to_csv(trades_file, index=False)
+    equity_df.to_csv(equity_file, index=False)
+    logger.info(f'\nSaved {trades_file} and {equity_file}')
 
     m = compute_metrics(trades, equity)
     if not m:
@@ -574,7 +669,13 @@ def run_backtest():
         net = grp['pnl_net'].sum()
         print(f'    {reason:<14}  {len(grp):>3}x  net=${net:+.2f}')
 
-    print('\n  NOTE: OFI gate disabled — upper-bound estimate.')
+    if OFI_GATE_ENABLED:
+        print('\n  NOTE: OFI gate ON — Binance taker-buy-volume PROXY, not an')
+        print('        order-book snapshot like live uses. See module docstring.')
+    else:
+        print('\n  NOTE: OFI gate disabled — upper-bound estimate.')
+    print(f'  NOTE: price data from {DATA_SOURCE.upper()}'
+          f'{" (research only — live trades on Kraken)" if DATA_SOURCE == "binance" else " (matches live venue)"}.')
     if FAST_MODE:
         print('  NOTE: FAST_MODE on (n_est=50, retrain every 5d).')
         print('        Run with FAST_MODE=False for exact live-equivalent.')
