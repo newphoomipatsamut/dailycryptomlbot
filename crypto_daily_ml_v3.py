@@ -200,8 +200,8 @@ def save_balance(meta_ws, balance: float) -> None:
         today = datetime.now(timezone.utc).isoformat()
         for i, row in enumerate(rows):
             if row and row[0] == 'balance':
-                meta_ws.update(f'A{i+1}:C{i+1}',
-                               [['balance', str(round(balance, 4)), today]])
+                meta_ws.update(range_name=f'A{i+1}:C{i+1}',
+                               values=[['balance', str(round(balance, 4)), today]])
                 return
         meta_ws.append_row(['balance', str(round(balance, 4)), today])
     except Exception as e:
@@ -750,7 +750,7 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                     and not row[5]
                 )
                 if match:
-                    trades_ws.update(f'A{i+1}:Q{i+1}', [[
+                    trades_ws.update(range_name=f'A{i+1}:Q{i+1}', values=[[
                         row[0],                               # row_id preserved
                         pos['date'], pos['symbol'], 'CLOSED',
                         round(float(pos['entry_price']), 6),
