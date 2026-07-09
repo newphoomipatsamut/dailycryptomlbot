@@ -9,6 +9,19 @@ Why daily vs tick scalping:
   - OFI correctly predicted direction 92% on tick data
   - On daily bars, RSI + ATR + EMA + momentum = strong signal set
 
+v5 fixes (from live-data audit):
+  [BUG]   check_exits() checked TP/SL against "today's" daily bar, which is
+          still partial when the bot runs (GitHub Actions scheduled runs
+          land ~4hrs into the UTC day on average across 119 runs, never
+          near the scheduled 00:05 UTC). Real intraday SL/TP hits after
+          the check could go undetected until the next run or be missed
+          entirely. Confirmed on a real trade (SOL, 2026-04-28): a real
+          SL breach happened after that day's check, went undetected,
+          and only got caught a day later looking like a TRAIL_BE save.
+          Now checks the most recently COMPLETE bar (yesterday) instead.
+          Entry price/signal generation unchanged — still uses live
+          "today" price.
+
 v3 additions (Fear & Greed + BTC Dominance):
   [FEATURE] Fear & Greed Index (alternative.me, free)
             fg_value, fg_extreme_fear, fg_extreme_greed, fg_momentum
@@ -533,7 +546,16 @@ def load_open_positions(trades_ws) -> list:
 def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
     """
     Check TP/SL/max-hold exits for all open positions.
-    Uses daily HIGH for TP, daily LOW for SL (intraday check).
+    Uses YESTERDAY's (most recently COMPLETE) daily HIGH/LOW for TP/SL —
+    not "today's" bar. GitHub Actions scheduled runs land ~4hrs into the
+    UTC day on average (confirmed empirically across 119 runs: 2.9-6.3h,
+    never near the scheduled 00:05 UTC), so "today's" bar is still
+    partial at check time — real intraday TP/SL hits after the check
+    could go undetected until the next run (delayed by a day, changing
+    e.g. a real SL into an apparent breakeven save), or be missed
+    entirely if price reversed back inside the range before then. Entry
+    price and signal generation still use "today's" live price — this
+    only changes how EXITS are evaluated, not entries.
 
     Trailing stop logic:
       Once daily HIGH reaches entry × (1 + BREAKEVEN_TRIGGER),
@@ -552,36 +574,47 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
 
         df       = ohlcv_data[sym]
         today_dt = datetime.strptime(today, '%Y-%m-%d').date()
+        check_dt = today_dt - timedelta(days=1)   # most recently complete bar
 
         try:
             entry_dt  = datetime.strptime(entry_date, '%Y-%m-%d').date()
-            hold_days = (today_dt - entry_dt).days
+            hold_days = (check_dt - entry_dt).days
         except Exception:
             hold_days = 0
 
-        # Today's candle
-        today_row = df[df.index == today_dt]
-        if today_row.empty:
-            today_row = df.iloc[[-1]]
+        if hold_days < 1:
+            # Entered today or yesterday — no complete bar to check yet.
+            logger.info(f'  HOLD {sym} | entered too recently for a complete bar')
+            continue
 
-        daily_high = float(today_row['high'].iloc[0])
-        daily_low  = float(today_row['low'].iloc[0])
-        close_px   = float(today_row['close'].iloc[0])
+        # Most recently complete candle (yesterday relative to this run).
+        # Deliberately no fallback to the latest row here — that would be
+        # today's partial bar again, reintroducing the bug this fixes.
+        check_row = df[df.index == check_dt]
+        if check_row.empty:
+            logger.warning(f'  {sym}: no complete candle for {check_dt} — skip check')
+            continue
+
+        daily_high = float(check_row['high'].iloc[0])
+        daily_low  = float(check_row['low'].iloc[0])
+        close_px   = float(check_row['close'].iloc[0])
 
         tp_price = entry_px * (1 + TAKE_PROFIT_PCT)
         sl_price = entry_px * (1 - STOP_LOSS_PCT)
 
         # ── Trailing stop: check if price ever touched breakeven trigger ──
-        # Scan all candles from entry date to today to see if HIGH ever
-        # reached entry × (1 + BREAKEVEN_TRIGGER) on any prior day.
-        # If yes, effective SL is raised to entry price (breakeven).
+        # Scan all COMPLETE candles from entry date up to (not including)
+        # the day being checked, to see if HIGH ever reached
+        # entry × (1 + BREAKEVEN_TRIGGER) on any earlier day, including
+        # the entry day itself. If yes, effective SL is raised to entry
+        # price (breakeven).
         be_trigger_px = entry_px * (1 + BREAKEVEN_TRIGGER)
         trailing_active = False
         try:
             entry_dt_ts = pd.Timestamp(entry_date).date()
-            hist = df[(df.index >= entry_dt_ts) & (df.index <= today_dt)]
-            if len(hist) > 1:  # at least one prior candle besides today
-                prior = hist.iloc[:-1]  # exclude today — check historical highs
+            hist = df[(df.index >= entry_dt_ts) & (df.index <= check_dt)]
+            if len(hist) > 1:  # at least one prior candle besides the checked day
+                prior = hist.iloc[:-1]  # exclude the day being checked
                 if (prior['high'] >= be_trigger_px).any():
                     trailing_active = True
         except Exception:
@@ -618,7 +651,7 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
             to_close.append({
                 **pos,
                 'exit_price':       exit_price,
-                'exit_date':        today,
+                'exit_date':        str(check_dt),
                 'pnl_pct':          exit_pnl,
                 'hold_days':        hold_days,
                 'reason':           reason,
