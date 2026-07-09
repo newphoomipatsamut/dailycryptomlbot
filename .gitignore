@@ -1,4 +1,5 @@
 backtest_trades*.csv
 backtest_equity*.csv
+live_ofi_comparison.csv
 __pycache__/
 *.pyc

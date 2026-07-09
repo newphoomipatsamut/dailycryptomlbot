@@ -5,6 +5,88 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-09 (session 3) — Real live OFI answer, a genuine backtest bug fixed, tracking tool added
+
+User asked to check the live `DailySignals`/`DailyTrades` Google Sheet (no
+local API access to it — see below) to answer the OFI question with real
+data instead of the Binance proxy from session 2. Found something more
+useful than expected.
+
+**Access note:** no local service-account credentials or sheet ID exist
+(they're GitHub Actions secrets); Google Drive OAuth via `/mcp` and the
+Chrome extension were both unavailable in this environment. User exported
+`DailySignals` and `DailyTrades` to CSV manually (Google Sheets > File >
+Download > CSV) and handed over the file paths — that's the path this
+session used and the one `analyze_live_ofi.py` (see below) expects.
+
+**Real finding (n=20, from actual live order-book OFI values, not a
+proxy):** every day the ML model wanted to enter, split by whether the
+live OFI gate passed (8, real trades) or blocked (12, reconstructed via
+forward Kraken price data):
+
+| Group | n | Mean pnl/trade | SL rate | TP rate |
+|---|---:|---:|---:|---:|
+| OFI passed (real trades) | 8 | +1.50% | 0% | 50% |
+| OFI blocked (reconstructed) | 12 | +0.83% | 42% | 42% |
+
+This is the **opposite** conclusion from session 2's Binance-proxy finding
+("cuts volume, not quality") — here the real gate looks like it's
+filtering for quality (zero raw stop-losses among what it passed).
+**n=20 is nowhere near enough to trust this either way** — logged as a
+hint to keep watching as more live history accumulates, not a conclusion.
+
+**Real bug found and fixed in `backtest.py`, discovered while validating
+the reconstruction against 8 known real outcomes (3 didn't match at
+first):**
+- `check_exit()`'s trailing-stop trigger only ever looks at days with
+  `hold_days>=1` — it never evaluates the entry day's own high. Live's
+  `check_exits()` (`crypto_daily_ml_v3.py`) scans `entry_date..yesterday`
+  *inclusive of the entry day* for the breakeven trigger. So a trade that
+  spiked 1.5%+ on its own entry day would get live's trailing-stop
+  protection starting immediately, but backtest.py wouldn't apply it until
+  day 2 — silently turning some real `TRAIL_BE` (breakeven) outcomes into
+  false `SL` (real loss) outcomes in the backtest. **Fixed**: entry loop
+  in `run_backtest()` now seeds `trailing_active` from the entry day's own
+  high before the first `check_exit()` call, matching live exactly.
+  Verified: 7/8 known real outcomes now match (was 5/8 before the fix).
+- The 1 remaining mismatch (SOL, 2026-04-28) is a *different*, structural
+  issue, not a bug to fix: live's cron runs ~4hr into the UTC day (not
+  exactly the scheduled 00:05), so "today's" bar is still partial at
+  check time — a same-day SL/TP breach that happens later that day isn't
+  caught until the next day's run. This is inherent to checking a
+  still-forming daily bar once per day; not something `backtest.py` can
+  or should replicate (it uses complete historical bars, which is the
+  more *correct* simulation for "what should have happened," just not an
+  exact replica of live's real-time blind spot).
+- **Impact on backtest numbers:** the fix increases realized `TRAIL_BE`
+  saves and reduces raw `SL` hits across the board. A quick Kraken
+  FAST_MODE=True check post-fix: **14.5% CAGR** (was 10.4% pre-fix,
+  same config otherwise) — the session-2 four-config comparison table is
+  now stale and wasn't fully rerun this session; regenerate if a fresh
+  number set is needed (`DATA_SOURCE=binance|kraken
+  OFI_GATE_ENABLED=true|false python3 backtest.py`, ~4 configs, several
+  minutes to an hour total).
+
+**New tool: `analyze_live_ofi.py`** — reusable script to answer the "does
+the live OFI gate filter quality or volume" question as more real history
+accumulates, without redoing this investigation from scratch:
+```
+python analyze_live_ofi.py --signals "DailySignals.csv" --trades "DailyTrades.csv"
+```
+Takes exported CSVs (see access note above), filters to days the ML model
+wanted to enter, cross-references real trades for the OFI-passed group and
+reconstructs (via the now-fixed `check_exit()`) for the OFI-blocked group,
+prints a comparison table with an explicit sample-size warning below n=30.
+Re-run this periodically — **the answer only gets more trustworthy as n
+grows**, and right now n=20 is not enough to act on.
+
+**Explicitly not done:** did not re-run the full session-2 four-config
+comparison table post-fix (noted stale above). Did not change live
+`crypto_daily_ml_v3.py` or make any strategy decision based on the n=20
+finding — that's still a call for the user once more data exists.
+
+---
+
 ## 2026-07-09 (session 2) — Deeper history via Binance, OFI gate backtested for real
 
 **Correction to session 1 below:** the "Kraken only lists these pairs from
@@ -161,25 +243,34 @@ caveat resolved first (see Open Items).
 
 ## Open items / where to pick up next
 
+- **Re-run `analyze_live_ofi.py` periodically as live history grows.**
+  n=20 as of 2026-07-09 is not enough to trust the OFI-gate finding
+  either direction (real data currently suggests the gate filters for
+  quality — opposite of session 2's Binance-proxy finding — but treat
+  that as a hint, not a conclusion, until n is much larger). Needs fresh
+  `DailySignals`/`DailyTrades` CSV exports each time (see script docstring
+  for why — no local API access to the sheet).
+- **Session-2's four-config comparison table (Kraken/Binance x OFI on/off)
+  is now stale** post the session-3 trailing-stop bug fix. Not fully
+  rerun this session. Regenerate if a fresh number set matters:
+  `DATA_SOURCE=binance|kraken OFI_GATE_ENABLED=true|false python3
+  backtest.py`, 4 runs, several minutes to ~an hour total.
 - **`FAST_MODE=False` on the full Binance 8yr history never run.** All
-  session-2 Binance numbers are FAST_MODE=True (n_est=50, retrain every
-  5d). Only the ~2yr Kraken window has an exact-mode number (7.5% CAGR).
-  An exact-mode run on Binance's 8yr range would likely take multiple
-  hours — worth doing before any real-money decision, not before.
-- **OFI proxy vs. live's real gate — still an open question.** The proxy
-  (Binance trade-flow imbalance) is *not* the same signal as live's
-  order-book depth snapshot. The finding that the proxy cuts trade volume
-  without improving win rate/profit factor is suggestive, not proven for
-  live's actual gate. Live's `DailySignals` sheet now logs OFI value per
-  day (has since v2) — once enough live history accumulates, that's the
-  real ground truth to check this against, not any backtest proxy.
-- **Whether to act on "OFI gate cuts volume, not quality"** — e.g.
-  reconsidering `OFI_GATE` threshold or gate design in the live bot — is
-  a strategy decision, explicitly not made this session. Ask the user.
-- **`backtest.py`'s new Binance/OFI capability not yet committed** as of
-  this note being written — check `git log` / `git status` on resume; if
-  still uncommitted, that's unusual and should be investigated (probably
-  means the session ended before wrap-up).
+  Binance numbers so far are FAST_MODE=True (n_est=50, retrain every 5d).
+  Would likely take multiple hours — worth doing before any real-money
+  decision, not before.
+- **Whether to act on either OFI finding** — e.g. reconsidering
+  `OFI_GATE` threshold or gate design in the live bot — is a strategy
+  decision, explicitly not made this session. Ask the user, and only once
+  n is large enough to mean something.
+- **Live's daily exit check runs against a partial "today" bar** (cron
+  lands ~4hr into the UTC day, not exactly the scheduled 00:05) — a
+  same-day SL/TP breach after that check isn't caught until the next
+  day's run. Documented as a known live-only behavior in session 3, not
+  fixed (nothing to fix — it's inherent to checking once/day against a
+  still-forming bar; would need intraday checks to close, which is a much
+  bigger change). Worth knowing about if a live outcome ever looks
+  surprising vs. what the backtest would have predicted.
 - **Node.js 20 deprecation warning in Actions logs** (from
   `actions/checkout@v3` / `actions/setup-python@v4`) — unrelated to bot
   code, cosmetic, not fixed. Bump to `@v4`/`@v5` if it starts actually
@@ -204,8 +295,14 @@ caveat resolved first (see Open Items).
   `OFI_GATE_ENABLED` env var (default false) turns on a Binance
   trade-flow-imbalance proxy for the OFI gate — not the same metric as
   live's order-book snapshot, see module docstring.
-- `requirements_daily.txt` — deps for both scripts.
+- `analyze_live_ofi.py` — compares real live OFI-gate outcomes (passed
+  vs. blocked) using exported `DailySignals`/`DailyTrades` CSVs. This is
+  the ground-truth check for the OFI question, separate from and more
+  trustworthy than `backtest.py`'s Binance proxy. See its docstring for
+  usage and caveats (sample size, partial-bar timing).
+- `requirements_daily.txt` — deps for all three scripts.
 - No test suite exists. Verification so far has been: `py_compile`,
   manual `workflow_dispatch` runs, manually recomputing backtest metrics
-  from output CSVs, and cross-checking new logic (OFI proxy) against an
-  independent instrumented re-implementation before trusting its numbers.
+  from output CSVs, and cross-checking new logic (OFI proxy, live-OFI
+  reconstruction) against independent re-implementations / known real
+  outcomes before trusting the numbers.

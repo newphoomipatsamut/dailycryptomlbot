@@ -364,6 +364,11 @@ def check_exit(pos: dict, today_dt: date_t, today_row: pd.Series) -> dict | None
     Check one open position against today's candle.
     Updates pos['trailing_active'] in place (checked BEFORE today's high).
     Returns an exit dict or None (hold).
+    Caller must seed pos['trailing_active'] from the entry day's own high
+    before the first call — see run_backtest()'s entry loop. Live's
+    check_exits() includes the entry day in its breakeven-trigger scan;
+    this function only ever sees hold_days>=1, so it can't discover that on
+    its own.
     """
     entry_px   = pos['entry_price']
     entry_date = pos['entry_date']
@@ -575,11 +580,17 @@ def run_backtest():
             trade_size = balance * RISK_PER_TRADE
             if trade_size < 15:
                 continue
+            # Live's check_exits() scans entry_date..yesterday (inclusive of the
+            # entry day itself) for the breakeven trigger, unlike check_exit()
+            # below which only evaluates hold_days>=1. Seed trailing_active here
+            # from the entry day's own high so backtest matches live exactly.
+            entry_high = float(ohlcv[sym].loc[today_dt, 'high'])
+            entry_trailing = entry_high >= entry_px * (1 + BREAKEVEN_TRIGGER)
             open_pos[sym] = {
                 'entry_price':    entry_px,
                 'entry_date':     today_dt,
                 'trade_size':     trade_size,
-                'trailing_active': False,
+                'trailing_active': entry_trailing,
                 'signal_prob':    sig['ensemble_prob'],
             }
 
