@@ -62,6 +62,22 @@ either direction, and the exit-execution code needs one small real
 order to validate before it can be trusted at any size. Neither of
 those closes just from this session's work.
 
+**Follow-up same session — confirmed with a fresh (not replayed) backtest
+run at the new 1% config:** `DATA_SOURCE=kraken python backtest.py`,
+same 2yr window (2024-07-21 → 2026-07-11): end balance $10,059.91,
++0.6% total return, 0.3% CAGR, -0.1% max drawdown, Sharpe 1.51, win rate
+34.8%, 187 trades, PF 1.59 — matches the session-10 replay projection
+almost exactly ($10,059.91 both times), confirming the sizing change
+works correctly and didn't silently change the strategy. Sizing-
+independent metrics (Sharpe, win rate, trade count, PF) are identical
+to the pre-sizing-change 25% run, as expected. Also re-checked live
+signal status: still correctly outputting no signal (ensemble probs
+0.25-0.33, all below the 0.60 threshold) — consistent with the
+session-8 mitigation (un-collapsed but genuinely uncertain, not
+artificially suppressed). Zero new live trades since the sizing change
+(no cron day has passed yet). No code changes this follow-up — read-only
+confirmation only.
+
 ---
 
 ## 2026-07-11 (session 9) — Kill switch + real exit execution (stop-loss orders, TP/max-hold sells) — UNEXERCISED against a real order
