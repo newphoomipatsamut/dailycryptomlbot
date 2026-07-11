@@ -144,6 +144,66 @@ trades since session 6 — the model hasn't fired).
 
 ---
 
+## 2026-07-11 (session 8) — Implemented the winsorize + XGB regularization fix (user-authorized)
+
+User explicitly asked to implement the fix identified in session 7.
+Applied to both `crypto_daily_ml_v3.py` and `backtest.py` (independently
+duplicated `train_and_predict`, kept in sync per established convention):
+- `winsorize_fit_apply()`: clips features to 1st/99th percentile, fit on
+  the training split only (no lookahead into val/today).
+- `XGBClassifier`: added `reg_lambda=5.0`, `min_child_weight=5`,
+  `gamma=0.5`.
+
+**A planned discriminator check (re-run the 10 known real trade entries,
+check they still clear 0.60) turned out to be unusable and was dropped**:
+0/10 failed to reproduce even at *unmodified baseline* params — the issue
+is that faithful historical point-in-time reconstruction isn't achievable
+locally (live's `fetch_ohlcv()` uses `limit=365` bars ending at the actual
+run time; Fear&Greed is cached at today's range; Kraken's `since=` behaves
+differently across calls). This is an environment/data-availability
+limitation, not evidence the fix is wrong — confirmed by ruling out the
+obvious causes (library version drift doesn't explain it, since *today's*
+reproduction matched the live log exactly). Do not attempt to re-derive
+historical live predictions locally again; it isn't reliable.
+
+**What IS verified (same-environment, same-day comparisons — trustworthy):**
+- XGB in-sample probability distribution: std 0.388→0.224, range
+  [0.02,0.98]→[0.11,0.89]. No longer bimodal. Mechanically confirmed fix.
+- Today's live probs (2026-07-11): XGB was 0.02–0.18 during the June/July
+  collapse: 0.13 pre-fix →  **0.22–0.34 post-fix** (workflow_dispatch run
+  `29148159484`, confirmed live, not just local). Un-collapsed.
+- Kraken backtest, same window, pre-fix (session 7: 305 trades, 35.7%
+  total) vs post-fix (187 trades, 15.9% total): trade count **−39%**,
+  but win/SL/TP rates flat-to-slightly-worse (SL 21.0%→20.3%, TP
+  37.7%→34.8%, TRAIL_BE 40.7%→44.9%). **Same shape as the session-2 OFI
+  finding: cuts volume, does not improve quality.** The CAGR/Sharpe drop
+  (16.7%→7.8%, 2.21→1.51) is NOT reported as a real effect — per the
+  session-4 caveat, 25% position sizing amplifies small mechanical
+  differences into large magnitude swings; only the rate-normalized
+  numbers above are trustworthy.
+
+**What this fix does NOT do:** it does not "un-dormant" the model or make
+it trade again. Today's ensemble probs (0.26–0.40) are still below the
+0.60 threshold — correctly, because conditions are genuinely uncertain
+right now, not because of any remaining bug. It stabilizes the model's
+output immediately instead of waiting for the crash outliers to roll out
+of the 180-day window (~Aug/Dec 2026). The root cause — 200-tree XGB on
+only 180 rows / 28 features — is mitigated, not fixed; `dow` (day-of-week,
+economically meaningless for a 24/7 market) is still a top-3 feature
+post-fix.
+
+**Verified end-to-end:** `py_compile` both files clean. Committed
+`fee9a46`, pushed. Live `workflow_dispatch` (run `29148159484`):
+success, no errors, XGB probs 0.22–0.34 confirmed in the actual log
+(not just local), 0 exits/0 entries (correct — still below threshold).
+
+**Live-trading verdict: UNCHANGED (still NO)** — this fix addresses one
+of the four blockers from session 6/7 (model output was untrustworthy);
+the other three (thin evidence, unsafe mechanics — no resting stops/
+kill-switch, 25% sizing) are untouched.
+
+---
+
 ## 2026-07-11 (session 5) — Bumped GitHub Actions off Node 20 before the daily cron breaks
 
 Two days after session 4, a check of the live runs surfaced one escalated
@@ -497,16 +557,18 @@ caveat resolved first (see Open Items).
 
 ## Open items / where to pick up next
 
-- **Model dormancy DIAGNOSED (session 7)** — not a bug, not permanent
-  drift: a real early-June flash crash (+ a Feb one still in-window) is
-  destabilizing an already-overfit XGBoost (180 rows/28 features, no
-  regularization, unstable since March). RF is more robust to the same
-  cause. Fix candidates (not yet implemented, needs a strategy-tuning
-  ask first): winsorize extreme daily returns, add XGB regularization
-  (`reg_lambda`/`min_child_weight`/`gamma`), or revisit the 180d lookback.
-  Model will very likely un-collapse naturally around 2026-08 (Feb outlier
-  rolls out of window) and ~2026-12 (June one) even with no code change —
-  worth checking again around then before assuming a fix is required.
+- **Model dormancy DIAGNOSED (session 7) and MITIGATED (session 8)** —
+  root cause: two real crash outliers (Feb, June 2026) destabilizing an
+  already-overfit XGBoost. Winsorizing + XGB regularization implemented,
+  committed `fee9a46`, verified live (probs un-collapsed 0.02-0.18 →
+  0.22-0.34). Does NOT make the model trade — still correctly outputs
+  <0.60 as of 2026-07-11, conditions are genuinely uncertain. Backtest
+  shows the fix cuts trade volume (-39%) without improving win/SL/TP
+  rates — same shape as the session-2 OFI finding. Root overfitting cause
+  (28 features / 180 rows, no other regularization) is still present,
+  just mitigated. If probabilities are still weirdly extreme/unstable
+  after ~2026-08 (Feb outlier rolls out) or ~2026-12 (June one), that's a
+  sign the mitigation isn't sufficient and needs revisiting.
 - **Forward test verdict is in (session 6): NOT ready for live capital.**
   n=10 trades underperformed buy-&-hold (+3.8% vs +4.4%); bookkeeping is
   trustworthy (9/10 fidelity) but the evidence is too thin and the model is
