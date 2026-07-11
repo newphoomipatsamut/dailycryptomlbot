@@ -80,6 +80,70 @@ Did not add safety rails. Did not flip PAPER_MODE.
 
 ---
 
+## 2026-07-11 (session 7) — Diagnosed model dormancy: real crash volatility destabilizing an over-fragile XGBoost, not drift or a bug
+
+Followed up on session 6's urgent finding (model dormant, 0 trades since
+2026-05-04). Traced ensemble/RF/XGB probability trajectories weekly from
+late April through July via GH Actions logs (`gh run view --log`), then
+reproduced `train_and_predict()` locally against live Kraken data to
+inspect what's actually driving it.
+
+**Initial read was wrong, caught by advisor review before writing it
+down:** first pass concluded "gradual synchronized decay across all 3
+symbols = high-variance noise, no real driver." That's internally
+contradictory — pure per-symbol noise doesn't produce a *correlated*
+multi-month decline across three independent models. Re-checked before
+committing to either story.
+
+**What's actually happening:**
+1. **RF and XGB probabilities were traced separately** (not just the
+   ensemble average). RF declined moderately (~0.50 in Apr/May → ~0.30 by
+   July). **XGB collapsed severely** (~0.50 range → 0.02–0.18, sharply
+   from ~2026-06-16 onward) — the ensemble average is being dragged down
+   mostly by XGB, not a uniform effect.
+2. **Real market cause found**: ETH/SOL/LINK all had a genuine flash-crash
+   2026-06-02→06-05 (ETH -10.6% single-day, -19.3% over 2wk; SOL -8.7%/
+   -23.0%; LINK -8.1%/-15.9% — confirmed via direct Kraken OHLCV, not
+   model output). A **second**, even larger outlier already sits in the
+   window: ETH -14.9% on 2026-02-05. `TRAIN_WINDOW=180` days is rolling,
+   so both outliers are currently inside every live training window (Feb
+   one rolls out ~Aug 2026, June one ~Dec 2026).
+3. **XGBoost is structurally fragile to this, and always was** — checked
+   its in-sample probability distribution at monthly cutoffs back to
+   March: std≈0.39, range [0.02, 0.98], bimodal, at *every* checkpoint
+   including when it was firing normally in Mar/Apr. 200 boosted trees,
+   depth 4, on only 180 training rows / 28 features, with no
+   regularization tuning — this was already overfit before the crashes;
+   the outliers just pushed its already-unstable output toward the
+   collapsed end and it's stayed there. `dow` (day-of-week — meaningless
+   for a 24/7 market) and `fg_extreme_fear` showing up as top features
+   every month is a consistent overfitting tell, not new.
+4. **RF is comparably more robust** (bagging + `min_samples_leaf=5`) —
+   declined too, but nowhere near as far, consistent with the same shared
+   outlier cause hitting a less fragile model less hard.
+
+**Verdict: the collapsed probabilities are the model reacting badly to
+real extreme volatility sitting in a fragile 180-day window — not concept
+drift in the "market permanently changed" sense, and not a code bug.**
+Current outputs (0.09–0.29 vs a 0.60 threshold) can't be trusted as a
+"no signal" read either way — they're a symptom of an outlier-sensitive
+XGB config, not necessarily an honest read of current conditions.
+
+**What this means for going live:** doesn't change the session-6 verdict
+(still NO) — if anything it adds a 4th reason. But it reframes the fix:
+this isn't "wait and see if it recovers" or "the edge never existed" —
+it's a concrete, fixable overfitting/outlier-sensitivity problem
+(winsorize extreme returns, add XGB regularization —
+`reg_lambda`/`min_child_weight`/`gamma`, or shorten/robustify the
+lookback). Whether to pursue that fix is a strategy decision — not made
+this session, per standing "ask before tuning" rule.
+
+**Explicitly not done:** no code changes. Did not implement any of the
+candidate fixes above. Did not re-run the forward test (no new live
+trades since session 6 — the model hasn't fired).
+
+---
+
 ## 2026-07-11 (session 5) — Bumped GitHub Actions off Node 20 before the daily cron breaks
 
 Two days after session 4, a check of the live runs surfaced one escalated
@@ -433,13 +497,16 @@ caveat resolved first (see Open Items).
 
 ## Open items / where to pick up next
 
-- **URGENT (session 6): the live model has gone dormant — diagnose why
-  before anything else.** Zero trades since 2026-05-04; every recent run
-  outputs ensemble probs 0.09–0.29 against a 0.60 fire threshold. Need to
-  retrain locally on current data and inspect feature values / probability
-  outputs to tell genuine-no-conviction from concept drift or a data break.
-  A dormant model can't be validated or traded live. Does not touch
-  strategy — this is "is the bot even working."
+- **Model dormancy DIAGNOSED (session 7)** — not a bug, not permanent
+  drift: a real early-June flash crash (+ a Feb one still in-window) is
+  destabilizing an already-overfit XGBoost (180 rows/28 features, no
+  regularization, unstable since March). RF is more robust to the same
+  cause. Fix candidates (not yet implemented, needs a strategy-tuning
+  ask first): winsorize extreme daily returns, add XGB regularization
+  (`reg_lambda`/`min_child_weight`/`gamma`), or revisit the 180d lookback.
+  Model will very likely un-collapse naturally around 2026-08 (Feb outlier
+  rolls out of window) and ~2026-12 (June one) even with no code change —
+  worth checking again around then before assuming a fix is required.
 - **Forward test verdict is in (session 6): NOT ready for live capital.**
   n=10 trades underperformed buy-&-hold (+3.8% vs +4.4%); bookkeeping is
   trustworthy (9/10 fidelity) but the evidence is too thin and the model is
