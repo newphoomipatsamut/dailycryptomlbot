@@ -5,6 +5,137 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-11 (session 9) — Kill switch + real exit execution (stop-loss orders, TP/max-hold sells) — UNEXERCISED against a real order
+
+User asked to start on stop-loss/kill-switch, one of the four live-trading
+blockers named across sessions 6-8. Investigation before coding surfaced a
+bigger gap than the request implied.
+
+**Critical finding: there was no sell-execution code anywhere.**
+`check_exits()` only computed what SHOULD happen on paper; `log_exit()`
+only wrote to the Sheet. `place_live_order()` placed a real BUY but
+nothing ever placed a real SELL. In live mode as it stood, the bot would
+buy real crypto on a signal and then never actually sell it — the
+position would sit open on the exchange indefinitely while the Sheet
+said "CLOSED". Asked the user how to scope the fix; they chose to build
+full exit execution, not just the stop-loss backstop alone (see
+AskUserQuestion in the session transcript).
+
+**API research (verified against primary sources before writing any
+order code, not secondhand ccxt docstrings which said "margin only" and
+turned out to be stale/inaccurate):**
+- Read the installed ccxt `kraken.py` source directly — `stopLossPrice`
+  param maps unconditionally to Kraken's native `stop-loss`/
+  `stop-loss-limit` ordertypes via `order_request()`.
+- Fetched Kraken's own Add Order API docs — `stop-loss`, `stop-loss-limit`
+  etc. are documented spot ordertypes, no margin-only restriction stated.
+- Also found Kraken's `close` param (attach a conditional order that
+  auto-triggers on the primary order's fill, OCO-like) — considered it,
+  but its own txid isn't in the create-order response (only discoverable
+  after fill via a separate lookup) AND whether it works on spot vs
+  margin-only is genuinely unconfirmed by either ccxt or Kraken's docs.
+  Advisor input: the honest discriminator (place one tiny real limit buy
+  with a `close` stop attached, see if Kraken accepts the shape) can't be
+  run — no real Kraken credentials exist locally, only as GH Actions
+  secrets. **Chose the separate stop-loss order path** (confirmed-legal)
+  over the unconfirmed atomic `close` mechanism, with a mandatory
+  fail-safe making up the difference (see below).
+
+**What was built (`crypto_daily_ml_v3.py`):**
+
+1. **Kill switch** — `KILL_SWITCH_DRAWDOWN=0.15` (~2-4x the backtest's
+   historical max drawdown of -3.5% to -9%). Tracks `peak_balance` +
+   `halted` in DailyMeta. Halts NEW entries only (doesn't force-liquidate
+   — dumping at a bad tick could compound damage). Manual reset required
+   (`halted` never auto-clears). **Fully testable in paper mode, fully
+   verified**: 7 unit tests against an in-memory mock Sheets worksheet +
+   3 full `run()` integration tests (mocked Sheets+exchange) — trips and
+   blocks entries on a 16% drawdown, doesn't spuriously trip on a healthy
+   balance, correctly resumes after manual reset. Committed separately as
+   `fe5de6c` before starting the higher-risk exit-execution work.
+
+2. **Resting stop-loss order at entry** (`place_stop_loss_order()`) — after
+   a live buy fills, places `stop-loss` (market-on-trigger, NOT
+   `stop-loss-limit` — a limit can gap through in a fast move and never
+   fill, defeating the entire point of a crash backstop) sized to the
+   ACTUAL filled qty (not the intended qty — taker fills can slip).
+   **Mandatory fail-safe**: if stop placement fails for any reason, the
+   position is flattened immediately via a market sell rather than held
+   naked hoping tomorrow's run catches it — this is the real safety
+   property the whole task exists for. Both outcomes (successful flatten,
+   or flatten-also-fails) are logged as real Sheet rows with accurate
+   PnL/balance — a real buy already happened, so neither path is a no-op.
+
+3. **Real sell execution for TP/trailing/max-hold exits**
+   (`place_live_sell()`) — `check_exits()` previously only computed the
+   theoretical outcome; nothing executed it. Now market-sells the actual
+   position and logs the ACTUAL fill price, not the theoretical TP/
+   trail/maxhold price.
+
+4. **Reconciliation, in the correct order** (`reconcile_stop_fills()`,
+   `cancel_stop_before_exit()`) — a resting stop can fill between daily
+   runs; the run has to learn about that from the exchange before
+   `check_exits()` runs, or a position the exchange already sold gets
+   double-counted as still open. Sequence: (a) for each open position
+   with a real stop id, ask the exchange if it filled overnight — if so,
+   log as a real SL exit at the actual fill price and remove from the
+   list `check_exits()` sees; (b) run `check_exits()` on the genuinely-
+   still-open remainder; (c) for any poll-driven exit (TP/trailing/max-
+   hold), cancel the resting stop FIRST — and don't just assume the
+   cancel succeeded. `cancel_stop_before_exit()` re-fetches order status
+   on a cancel failure to distinguish "stop already filled" (that IS the
+   real exit — do not sell again, log the stop's actual fill instead)
+   from "fully unresolved" (do not sell blind — skip this run, retry
+   next time, surface loudly). Handles 3 stop_order_id states correctly:
+   real id, `''` (paper/pre-migration rows), `'FLATTEN_FAILED'` sentinel
+   (an already-fully-logged entry-time failure, never queried as if it
+   were a live order).
+
+5. **Sheet schema**: `DailyTrades` widened 17->19 cols (`stop_order_id`,
+   `fill_qty`), migration is idempotent and patches existing sheets'
+   headers in place rather than requiring a fresh sheet.
+
+**Verification — and its explicit limits.** The order-placement/
+reconciliation code is gated on `not PAPER_MODE`, and the daily GH
+Actions cron always runs `PAPER_MODE=true` — so the normal
+commit->workflow_dispatch->read-log verification loop CANNOT exercise
+any of this new code end-to-end against a real order. Per advisor
+guidance: did not flip PAPER_MODE to test real fills (that's the
+dangerous kind of scope creep for a change like this). Instead:
+- Re-ran the full paper-mode `run()` integration test (mocked
+  Sheets+exchange) after ALL the exit-execution changes — confirms the
+  new code paths don't break the only path that actually runs in
+  production. Passed clean, reconciliation correctly skipped entirely.
+- Unit-tested `reconcile_stop_fills()` and `cancel_stop_before_exit()`
+  against a mocked exchange covering: stop filled overnight, stop still
+  resting, `fetch_order` transient failure (must NOT silently drop the
+  position), cancel-races-fill (the stop beats the cancel — must NOT
+  sell again), fully-unresolved cancel+fetch failure (must NOT sell
+  blind), and both sentinel/empty stop_order_id states (must never
+  query the exchange for these). All passed.
+
+**LABEL THIS UNEXERCISED until validated against one small real order.**
+Structurally correct + fail-safe + mock-tested is the ceiling reachable
+without real capital or credentials. Three real bugs were caught and
+fixed DURING this session by re-deriving the flow carefully (fail-safe
+not logging the real round-trip trade, `log_exit`'s Sheet-write range
+missing the new stop_order_id/fill_qty columns, `active_syms`/summary
+counts not accounting for reconciled exits) — that pattern (repeated
+"wait, real bug I just introduced" catches) is itself the signal that
+blind inspection is near its useful limit for money-code with no way to
+run it for real. **Before ever flipping PAPER_MODE=false: place one tiny
+real order manually first and confirm the stop-loss mechanism actually
+works as expected on Kraken** — mocks can't catch everything a real
+exchange response might do differently.
+
+**Explicitly not done this session:** did not validate the `close`
+atomic OCO mechanism (deferred, unconfirmed on spot); did not touch
+strategy/ML code; did not flip PAPER_MODE; did not reduce
+`RISK_PER_TRADE` from 25% (still a live-trading blocker — sizing wasn't
+in scope for this session, only stop-loss/kill-switch).
+
+---
+
 ## 2026-07-11 (session 6) — Forward test (the go/no-go gate): NOT falsified, but NOT proven, and the model has gone dormant
 
 User asked "can this trade live yet — I've run paper since February." Ran
@@ -557,6 +688,17 @@ caveat resolved first (see Open Items).
 
 ## Open items / where to pick up next
 
+- **Kill switch + real exit execution built (session 9), UNEXERCISED
+  against a real order.** Resting stop-loss orders, real TP/max-hold
+  sell execution, and overnight reconciliation are all implemented and
+  mock-tested, but the order-placement code has NEVER run against a real
+  Kraken order (gated on `PAPER_MODE=false`, which the daily cron never
+  sets). Before ever flipping `PAPER_MODE=false`: place one tiny manual
+  real order first and confirm the stop-loss mechanism behaves as
+  expected — do not trust this code at full size on the strength of
+  mocks alone. `RISK_PER_TRADE` is still 25% (unchanged, out of scope
+  for session 9) — needs to come down before real capital regardless of
+  how the exit-execution code performs.
 - **Model dormancy DIAGNOSED (session 7) and MITIGATED (session 8)** —
   root cause: two real crash outliers (Feb, June 2026) destabilizing an
   already-overfit XGBoost. Winsorizing + XGB regularization implemented,

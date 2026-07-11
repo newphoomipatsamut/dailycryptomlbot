@@ -167,12 +167,28 @@ def init_sheets():
                 ws.append_row(headers)
                 return ws
 
-        trades_ws  = get_or_create('DailyTrades', 5000, 17, [
+        trades_ws  = get_or_create('DailyTrades', 5000, 19, [
             'row_id', 'date', 'symbol', 'action', 'entry_price', 'exit_price',
             'pnl_gross', 'pnl_net', 'fees', 'reason',
             'hold_days', 'win', 'balance_after',
-            'signal_prob', 'rf_prob', 'xgb_prob', 'trade_size',
+            'signal_prob', 'rf_prob', 'xgb_prob', 'trade_size', 'stop_order_id',
+            'fill_qty',
         ])
+        # Sheet may pre-date the stop_order_id/fill_qty columns (R, S) —
+        # patch headers in place if an existing sheet is missing them. New
+        # rows always write the full width; a missing header would only
+        # cost a label, but load_open_positions()/reconciliation read both
+        # by column name via get_all_records(), so headers must be present.
+        # Idempotent across repeated 17->18->19 width migrations — each
+        # column is checked/patched independently.
+        try:
+            existing_header = trades_ws.row_values(1)
+            if 'stop_order_id' not in existing_header:
+                trades_ws.update(range_name='R1', values=[['stop_order_id']])
+            if 'fill_qty' not in existing_header:
+                trades_ws.update(range_name='S1', values=[['fill_qty']])
+        except Exception as e:
+            logger.error(f'DailyTrades header patch failed: {e}')
         signals_ws = get_or_create('DailySignals', 50000, 13, [
             'date', 'symbol', 'close', 'ensemble_prob', 'rf_prob', 'xgb_prob',
             'signal_fired', 'reject_reason', 'ofi_value', 'ofi_gate_pass',
@@ -636,6 +652,80 @@ def load_open_positions(trades_ws) -> list:
         logger.error(f'Load positions failed: {e}')
         return []
 
+def reconcile_stop_fills(exchange, open_positions: list, today: str) -> tuple:
+    """
+    Live-mode only. For every open position holding a real resting
+    stop-loss order id, ask the exchange whether it has filled overnight
+    (the exchange enforces the stop in real time; this daily run only
+    learns about it after the fact). Must run BEFORE check_exits() —
+    check_exits() only knows about Sheet state and OHLCV, so a position
+    the exchange already sold would otherwise get double-counted as
+    still-open and re-evaluated for a phantom exit. See PROGRESS.md
+    session 9.
+
+    stop_order_id can be: a real Kraken order id, '' (paper-mode rows or
+    pre-migration rows — never queried), or the 'FLATTEN_FAILED' sentinel
+    (an entry-time failure already fully logged — never queried, it does
+    not represent a live resting order).
+
+    Returns (still_open, filled_exits):
+      still_open   — positions whose stop has NOT filled; pass to
+                     check_exits() as normal.
+      filled_exits — dicts in the same shape check_exits() produces
+                     (ready for log_exit()), for positions the exchange
+                     already closed via the stop.
+    """
+    still_open   = []
+    filled_exits = []
+
+    for pos in open_positions:
+        stop_id = str(pos.get('stop_order_id', '')).strip()
+        if not stop_id or stop_id == 'FLATTEN_FAILED':
+            still_open.append(pos)
+            continue
+
+        sym = pos['symbol']
+        try:
+            status = exchange.fetch_order(stop_id, sym)
+        except Exception as e:
+            # Can't confirm either way — err toward treating it as still
+            # open (check_exits() will re-evaluate it against OHLCV; the
+            # resting stop, if genuinely still there, remains protective
+            # either way). Do NOT silently drop the position.
+            logger.warning(f'  {sym}: fetch_order({stop_id}) failed ({e}) '
+                           f'— treating as still open this run')
+            still_open.append(pos)
+            continue
+
+        if status.get('status') == 'closed':
+            entry_px   = float(pos['entry_price'])
+            exit_px    = float(status.get('average') or 0.0) or entry_px * (1 - STOP_LOSS_PCT)
+            pnl_pct    = (exit_px - entry_px) / entry_px
+            entry_date = str(pos['date'])
+            try:
+                hold_days = (datetime.strptime(today, '%Y-%m-%d').date()
+                            - datetime.strptime(entry_date, '%Y-%m-%d').date()).days
+            except Exception:
+                hold_days = 0
+            logger.info(f'  RECONCILE {sym}: resting stop {stop_id} filled '
+                       f'overnight @ {exit_px:.4f} (pnl={pnl_pct*100:+.2f}%)')
+            filled_exits.append({
+                **pos,
+                'exit_price': exit_px,
+                'exit_date':  today,
+                'pnl_pct':    pnl_pct,
+                'hold_days':  hold_days,
+                'reason':     'SL',   # a filled resting stop IS a real stop-loss
+                'trailing_active': False,
+            })
+        else:
+            # Still resting — genuinely open, check_exits() may still
+            # trigger TP/trailing/max-hold against it.
+            still_open.append(pos)
+
+    return still_open, filled_exits
+
+
 def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
     """
     Check TP/SL/max-hold exits for all open positions.
@@ -816,7 +906,8 @@ def log_signal(signals_ws, today: str, symbol: str,
 def log_entry(trades_ws, signals_ws, today: str, symbol: str,
               entry_price: float, signal: dict,
               ofi_val: float, balance: float,
-              features_row: pd.Series, trade_size: float) -> str:
+              features_row: pd.Series, trade_size: float,
+              stop_order_id: str = '', fill_qty: float | str = '') -> str:
     """Log new trade entry to DailyTrades. Returns row_id for later exit update."""
     row_id = _next_row_id(trades_ws) if trades_ws else 'T0000'
 
@@ -831,6 +922,8 @@ def log_entry(trades_ws, signals_ws, today: str, symbol: str,
                 round(signal['rf_prob'], 4),
                 round(signal['xgb_prob'], 4),
                 round(trade_size, 4),             # col Q — used by log_exit
+                stop_order_id,                    # col R — resting stop order id, live-mode only
+                round(fill_qty, 8) if fill_qty != '' else '',  # col S — actual filled base-asset qty, live-mode only
             ], value_input_option='RAW')
         except Exception as e:
             logger.error(f'Log entry failed: {e}')
@@ -876,7 +969,7 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                     and not row[5]
                 )
                 if match:
-                    trades_ws.update(range_name=f'A{i+1}:Q{i+1}', values=[[
+                    trades_ws.update(range_name=f'A{i+1}:S{i+1}', values=[[
                         row[0],                               # row_id preserved
                         pos['date'], pos['symbol'], 'CLOSED',
                         round(float(pos['entry_price']), 6),
@@ -888,6 +981,14 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                         row[14] if len(row) > 14 else '',
                         row[15] if len(row) > 15 else '',
                         row[16] if len(row) > 16 else round(trade_size, 4),
+                        # col R: stop_order_id cleared on close — the resting
+                        # stop must already be cancelled (or itself the
+                        # trigger for this exit) by the time log_exit runs.
+                        # See check_exits()/run() reconciliation.
+                        '',
+                        # col S: fill_qty cleared — position is fully closed,
+                        # nothing left to reference the base-asset qty for.
+                        '',
                     ]])
                     break
         except Exception as e:
@@ -899,12 +1000,15 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
 # LIVE ORDER (with fill confirmation)
 # ─────────────────────────────────────────────────────────────
 def place_live_order(exchange, symbol: str, trade_size: float,
-                     entry_px: float) -> bool:
+                     entry_px: float) -> dict | None:
     """
     Place limit buy with 60s fill timeout. No post-only flag so the order
     fills immediately as a taker if price has moved — avoids being rejected
     on the breakouts where the ML signal fires.
-    Returns True if filled, False otherwise.
+    Returns {'fill_price': float, 'fill_qty': float} if filled, else None.
+    fill_qty comes from the exchange's own 'filled' field — NOT recomputed
+    from trade_size/entry_px — so the caller sizes any dependent order
+    (e.g. the stop-loss) off what was actually bought, not what was intended.
     """
     import time
     try:
@@ -920,21 +1024,140 @@ def place_live_order(exchange, symbol: str, trade_size: float,
             time.sleep(5)
             status = exchange.fetch_order(order_id, symbol)
             if status['status'] == 'closed':
-                fill_px = float(status.get('average', entry_px))
-                logger.info(f'  FILLED @ {fill_px:.4f}')
-                return True
+                fill_px  = float(status.get('average') or entry_px)
+                fill_qty = float(status.get('filled') or qty)
+                logger.info(f'  FILLED {fill_qty:.6f} {symbol} @ {fill_px:.4f}')
+                return {'fill_price': fill_px, 'fill_qty': fill_qty}
             if status['status'] == 'canceled':
                 logger.warning(f'  Order {order_id} was cancelled')
-                return False
+                return None
 
         # Timeout — cancel
         exchange.cancel_order(order_id, symbol)
         logger.warning(f'  Order {order_id} timed out — cancelled')
-        return False
+        return None
 
     except Exception as e:
         logger.error(f'  Live order failed: {e}')
-        return False
+        return None
+
+
+def place_stop_loss_order(exchange, symbol: str, qty: float,
+                          stop_px: float) -> str | None:
+    """
+    Place a resting stop-loss-market order on Kraken for an already-filled
+    long position — the crash backstop for the once-daily check_exits()
+    poll (see PROGRESS.md session 9: a resting exchange-side stop protects
+    against intraday moves the daily poll can't see until the next run).
+
+    Uses 'stop-loss' (market-on-trigger), not 'stop-loss-limit': a limit
+    order can gap through in a fast move and never fill, which would
+    silently defeat the whole point of this backstop. A guaranteed exit
+    with slippage beats a protected-on-paper position that never actually
+    sells.
+
+    stopLossPrice is a documented Kraken spot ordertype (stop-loss /
+    stop-loss-limit are listed for the Add Order endpoint, no margin-only
+    restriction in Kraken's own docs — see PROGRESS.md session 9 for the
+    verification trail). NOT exercised against a real order yet — treat
+    as unverified until confirmed with one small live trade.
+
+    Returns the stop order's id, or None on failure. Caller MUST treat
+    None as "position is unprotected" and fail safe (flatten immediately
+    via place_live_sell) — never hold a live position with no resting
+    stop and just hope the next day's run catches it.
+    """
+    try:
+        order = exchange.create_order(
+            symbol, 'market', 'sell', qty, None,
+            {'stopLossPrice': stop_px}
+        )
+        order_id = order['id']
+        logger.info(f'  Stop-loss placed: {order_id} | {qty:.6f} {symbol} '
+                    f'trigger@{stop_px:.4f}')
+        return order_id
+    except Exception as e:
+        logger.error(f'  Stop-loss placement failed: {e}')
+        return None
+
+
+def cancel_stop_before_exit(exchange, order_id: str, symbol: str) -> dict:
+    """
+    Cancel a resting stop-loss order before executing a poll-driven exit
+    (TP/trailing/max-hold) — must run first, or the stop can fill
+    concurrently and the position gets sold twice. A cancel failure is
+    NOT automatically safe to ignore: it can mean the stop already
+    filled (which IS the real exit — must not sell again), so this
+    re-fetches order status on failure to tell the two cases apart
+    instead of assuming success.
+
+    Returns {'cancelled': bool, 'already_filled': bool, 'fill_price': float|None}.
+    Caller logic:
+      cancelled=True                    -> proceed with the poll-driven sell.
+      already_filled=True               -> do NOT sell; log the SL exit at
+                                            fill_price instead (the stop was
+                                            the real exit, not the poll logic).
+      both False (fetch_order also failed) -> unresolved; do NOT sell blind,
+                                            surface loudly for manual check.
+    """
+    if not order_id or order_id == 'FLATTEN_FAILED':
+        return {'cancelled': True, 'already_filled': False, 'fill_price': None}
+    try:
+        exchange.cancel_order(order_id, symbol)
+        logger.info(f'  Cancelled resting stop {order_id}')
+        return {'cancelled': True, 'already_filled': False, 'fill_price': None}
+    except Exception as e:
+        logger.warning(f'  Cancel {order_id} failed ({e}) — checking if it '
+                       f'already filled...')
+        try:
+            status = exchange.fetch_order(order_id, symbol)
+            if status.get('status') == 'closed':
+                fill_px = float(status.get('average') or 0.0) or None
+                logger.warning(f'  {symbol}: stop {order_id} had ALREADY '
+                               f'FILLED @ {fill_px} — that is the real exit, '
+                               f'not the poll-driven one about to be skipped')
+                return {'cancelled': False, 'already_filled': True, 'fill_price': fill_px}
+        except Exception as e2:
+            logger.error(f'  {symbol}: could not confirm stop {order_id} '
+                        f'status after cancel failure ({e2}) — unresolved, '
+                        f'manual check required')
+        return {'cancelled': False, 'already_filled': False, 'fill_price': None}
+
+
+def place_live_sell(exchange, symbol: str, qty: float) -> dict | None:
+    """
+    Market-sell an existing long position to close it — used for TP/
+    trailing/max-hold exits (check_exits() only computes what SHOULD
+    happen; this is what actually executes it against the exchange), and
+    as the fail-safe flatten when a resting stop-loss can't be confirmed.
+    Market, not limit: on an exit we want certainty of fill over price,
+    same reasoning as place_stop_loss_order.
+    Returns {'fill_price': float, 'fill_qty': float} if filled, else None.
+    """
+    import time
+    try:
+        order = exchange.create_market_sell_order(symbol, qty)
+        order_id = order['id']
+        logger.info(f'  Market sell placed: {order_id} | {qty:.6f} {symbol}')
+
+        # Market orders normally fill immediately, but poll briefly to
+        # confirm and get the actual fill price for accurate PnL logging.
+        for _ in range(6):   # 6 x 2s = 12s
+            time.sleep(2)
+            status = exchange.fetch_order(order_id, symbol)
+            if status['status'] == 'closed':
+                fill_px  = float(status.get('average') or 0.0)
+                fill_qty = float(status.get('filled') or qty)
+                logger.info(f'  SOLD {fill_qty:.6f} {symbol} @ {fill_px:.4f}')
+                return {'fill_price': fill_px, 'fill_qty': fill_qty}
+
+        logger.error(f'  Market sell {order_id} did not confirm closed '
+                     f'within 12s — check exchange manually')
+        return None
+
+    except Exception as e:
+        logger.error(f'  Live sell failed: {e}')
+        return None
 
 # ─────────────────────────────────────────────────────────────
 # MAIN DAILY RUN
@@ -994,9 +1217,64 @@ def run():
 
     # ── Check exits (TP/SL/max hold) ─────────────────────────
     logger.info('\nChecking exits...')
-    to_close = check_exits(open_positions, ohlcv_data, today)
+
+    # Live mode: ask the exchange whether any resting stop filled
+    # overnight BEFORE running check_exits()'s Sheet+OHLCV-only logic —
+    # otherwise a position the exchange already sold would get
+    # re-evaluated as still open. See reconcile_stop_fills() docstring.
+    reconciled_exits = []
+    positions_to_check = open_positions
+    if not PAPER_MODE:
+        positions_to_check, reconciled_exits = reconcile_stop_fills(
+            exchange, open_positions, today)
+        for pos in reconciled_exits:
+            balance = log_exit(trades_ws, pos, balance)
+
+    to_close = check_exits(positions_to_check, ohlcv_data, today)
     for pos in to_close:
-        balance = log_exit(trades_ws, pos, balance)
+        if PAPER_MODE:
+            balance = log_exit(trades_ws, pos, balance)
+            continue
+
+        # Live mode: this is a poll-driven exit (TP/trailing/max-hold),
+        # not a stop fill (those were already handled above). MUST cancel
+        # the resting stop before selling, or the stop can fill
+        # concurrently and the position gets sold twice.
+        stop_id = str(pos.get('stop_order_id', '')).strip()
+        cancel_result = cancel_stop_before_exit(exchange, stop_id, pos['symbol'])
+
+        if cancel_result['already_filled']:
+            # The stop beat the poll to it — that IS the real exit.
+            # Overwrite pos's theoretical exit with the stop's actual fill.
+            fill_px = cancel_result['fill_price'] or (
+                float(pos['entry_price']) * (1 - STOP_LOSS_PCT))
+            pos = {**pos, 'exit_price': fill_px,
+                  'pnl_pct': (fill_px - float(pos['entry_price'])) / float(pos['entry_price']),
+                  'reason': 'SL'}
+            balance = log_exit(trades_ws, pos, balance)
+        elif cancel_result['cancelled']:
+            fill_qty = float(pos.get('fill_qty', 0) or 0)
+            if fill_qty <= 0:
+                logger.error(f'  {pos["symbol"]}: no fill_qty on record — '
+                            f'cannot sell, manual check required')
+                continue
+            sold = place_live_sell(exchange, pos['symbol'], fill_qty)
+            if sold:
+                pos = {**pos, 'exit_price': sold['fill_price'],
+                      'pnl_pct': (sold['fill_price'] - float(pos['entry_price'])) / float(pos['entry_price'])}
+                balance = log_exit(trades_ws, pos, balance)
+            else:
+                logger.error(f'  {pos["symbol"]}: sell failed after stop '
+                            f'cancel — position may be open and '
+                            f'UNPROTECTED (stop was just cancelled). '
+                            f'Manual intervention required immediately.')
+        else:
+            # Neither cancelled nor confirmed filled — unresolved state.
+            # Do NOT sell blind (could double-sell against a stop that's
+            # about to fill) and do NOT log an exit (position may still
+            # be genuinely open and protected by its still-resting stop).
+            logger.error(f'  {pos["symbol"]}: stop cancel unresolved — '
+                        f'skipping this exit, will retry next run')
 
     # FIX BUG 1: persist updated balance after exits
     save_balance(meta_ws, balance)
@@ -1015,7 +1293,10 @@ def run():
 
     # ── Generate ML signals ───────────────────────────────────
     logger.info('\nGenerating signals...')
-    closed_syms = {p['symbol'] for p in to_close}
+    # closed_syms must include BOTH check_exits()'s poll-driven exits AND
+    # reconcile_stop_fills()'s overnight stop fills — a symbol closed via
+    # either path is no longer an active position.
+    closed_syms = {p['symbol'] for p in to_close} | {p['symbol'] for p in reconciled_exits}
     active_syms = {p['symbol'] for p in open_positions
                    if p['symbol'] not in closed_syms}
     n_open      = len(active_syms)
@@ -1106,13 +1387,65 @@ def run():
                     f'TP={entry_px*(1+TAKE_PROFIT_PCT):.4f} '
                     f'SL={entry_px*(1-STOP_LOSS_PCT):.4f}')
 
-        filled = True
+        filled       = True
+        stop_order_id = ''
         if not PAPER_MODE:
-            filled = place_live_order(exchange, sym, trade_size, entry_px)
+            fill = place_live_order(exchange, sym, trade_size, entry_px)
+            filled = fill is not None
+            if filled:
+                # Use the ACTUAL fill price/qty, not the intended entry_px —
+                # slippage on a taker fill can differ from the quoted price.
+                entry_px = fill['fill_price']
+                fill_qty = fill['fill_qty']
+                sl_px    = entry_px * (1 - STOP_LOSS_PCT)
+                stop_order_id = place_stop_loss_order(exchange, sym, fill_qty, sl_px)
+                if not stop_order_id:
+                    # FAIL SAFE: never hold a live position with no resting
+                    # stop — flatten immediately rather than hope tomorrow's
+                    # run catches an unprotected crash. See PROGRESS.md
+                    # session 9. A real buy already executed, so either
+                    # outcome below still needs a real Sheet record — this
+                    # is a real (if unwanted) round-trip trade, not a no-op.
+                    logger.error(f'  {sym}: stop-loss placement failed — '
+                                f'flattening position immediately (fail-safe)')
+                    sold = place_live_sell(exchange, sym, fill_qty)
+                    if sold:
+                        exit_px = sold['fill_price']
+                        pnl_pct = (exit_px - entry_px) / entry_px
+                        logger.error(f'  {sym}: flattened @ {exit_px:.4f} '
+                                    f'(pnl={pnl_pct*100:+.2f}%) — SL placement '
+                                    f'failure, not a strategy exit')
+                        row_id = log_entry(trades_ws, signals_ws, today, sym,
+                                           entry_px, sig, ofi_val, balance,
+                                           feats_row, trade_size, '', fill_qty)
+                        balance = log_exit(trades_ws, {
+                            'row_id': row_id, 'symbol': sym, 'date': today,
+                            'entry_price': entry_px, 'exit_price': exit_px,
+                            'pnl_pct': pnl_pct, 'hold_days': 0,
+                            'reason': 'SL_PLACEMENT_FAILED',
+                            'trade_size': trade_size,
+                        }, balance)
+                    else:
+                        logger.error(f'  {sym}: FLATTEN FAILED — position may be '
+                                    f'open and UNPROTECTED on the exchange. '
+                                    f'Manual intervention required immediately.')
+                        # Log as a held (unprotected) position so it shows up
+                        # in load_open_positions() next run rather than being
+                        # silently lost — better a visibly-broken row than no
+                        # record of real capital sitting on the exchange.
+                        log_entry(trades_ws, signals_ws, today, sym,
+                                 entry_px, sig, ofi_val, balance, feats_row,
+                                 trade_size, 'FLATTEN_FAILED', fill_qty)
+                        n_open += 1
+                        active_syms.add(sym)
+                    filled = False   # already logged above (or intentionally
+                                     # left open+unprotected) — skip the
+                                     # normal log_entry below either way
 
         if filled:
             log_entry(trades_ws, signals_ws, today, sym,
-                      entry_px, sig, ofi_val, balance, feats_row, trade_size)
+                      entry_px, sig, ofi_val, balance, feats_row, trade_size,
+                      stop_order_id, fill_qty if not PAPER_MODE else '')
             n_open += 1
             active_syms.add(sym)
 
@@ -1125,8 +1458,9 @@ def run():
     logger.info(f'  Kill switch: {"HALTED" if halted else "ok"}  '
                 f'(peak=${peak_balance:.2f} drawdown={drawdown*100:.1f}% '
                 f'threshold={KILL_SWITCH_DRAWDOWN*100:.0f}%)')
-    logger.info(f'  Exits      : {len(to_close)} | New entries: '
-                f'{n_open - (len(open_positions)-len(to_close))} | '
+    n_exits = len(to_close) + len(reconciled_exits)
+    logger.info(f'  Exits      : {n_exits} | New entries: '
+                f'{n_open - (len(open_positions)-n_exits)} | '
                 f'Open: {n_open}/{MAX_POSITIONS}')
     logger.info(f'  Signals    :')
     for sym, sig in signals.items():
