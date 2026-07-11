@@ -5,6 +5,65 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-11 (session 10) — Lowered position sizing 25% → 1% for real-capital readiness
+
+User asked to bring position sizing down to 1-2% risk per trade — the
+last of the four live-trading blockers named across sessions 6-9 (thin
+evidence, dormant model, unsafe mechanics, oversized sizing).
+
+**Change:** `RISK_PER_TRADE` 0.25 → 0.01 in both `crypto_daily_ml_v3.py`
+and `backtest.py` (kept in sync per established convention). Chose 1%
+over 2% — the conservative end of the requested range — given where the
+bot actually stands: live evidence is still thin (n=10 trades total,
+session 6's forward test), and the session-9 stop-loss/exit-execution
+code is still unexercised against a real Kraken order. Bump upward only
+once both have more runway.
+
+**Quantified the effect instead of guessing** — replayed the session-8
+post-fix backtest's actual trade sequence (same entries/exits/pnl_pct,
+sizing scaled) at 25%/2%/1%:
+
+| Risk | End balance | Return | Max DD | Win rate | Trades |
+|---|---:|---:|---:|---:|---:|
+| 25% (old) | $11,592.92 | +15.93% | 2.21% | 35% | 187 |
+| 2% | $10,120.13 | +1.20% | 0.18% | 35% | 187 |
+| 1% (new) | $10,059.91 | +0.60% | 0.09% | 35% | 187 |
+
+Win rate/trade count identical across all three, as expected — sizing
+only changes how much capital rides each trade, not which trades fire.
+
+**Noted, left unchanged:** `KILL_SWITCH_DRAWDOWN=15%` (session 9) was
+calibrated against the 25%-risk backtest's realized drawdown (2.21%,
+~7x margin). At 1% risk the same sequence produces ~0.09% drawdown, so
+the kill switch now needs something far more catastrophic than anything
+in the backtest's history to trip. It still serves as a backstop against
+a genuinely broken scenario (sizing bug, correlated multi-symbol
+disaster) — flagged rather than silently retuned, since it wasn't asked
+for.
+
+**Also noted:** `MIN_ORDER_USDT=$15` still clears comfortably at the
+$10,000 paper balance (trade_size=$100, 6.7x headroom), but the
+`MIN_ORDER_SIZE` reject now kicks in below a ~$1,500 balance (was ~$60
+at 25%) — a real consequence of smaller sizing, not a bug, just worth
+knowing if the paper balance is ever lowered.
+
+**Verified:** paper-mode `run()` integration test re-run clean; a
+forced-signal test (patched `train_and_predict` to force a fire)
+confirms live entries size to exactly $100 (1% of $10,000) as expected.
+Committed `fbc5240`, verified end-to-end via `workflow_dispatch` run
+`29149798965` — clean, no errors, kill switch tracking correctly.
+
+**Where this leaves the live-trading question overall:** all four named
+blockers now have work done against them — dormancy diagnosed/mitigated
+(session 7-8), exit execution + kill switch built (session 9, still
+unexercised against a real order), sizing brought down (session 10).
+Evidence is still the open one: n=10 live trades is not enough to trust
+either direction, and the exit-execution code needs one small real
+order to validate before it can be trusted at any size. Neither of
+those closes just from this session's work.
+
+---
+
 ## 2026-07-11 (session 9) — Kill switch + real exit execution (stop-loss orders, TP/max-hold sells) — UNEXERCISED against a real order
 
 User asked to start on stop-loss/kill-switch, one of the four live-trading
@@ -700,6 +759,12 @@ caveat resolved first (see Open Items).
 
 ## Open items / where to pick up next
 
+- **RISK_PER_TRADE LOWERED (session 10): 25% → 1%**, in both live and
+  backtest.py. Any backtest CAGR/Sharpe/drawdown numbers from BEFORE
+  commit `fbc5240` are not comparable at face value (they scale with
+  position size) — win rate/PF/trade count are still comparable. Bump
+  upward only once live evidence (n=10, still thin) and the
+  exit-execution code below have more runway.
 - **Kill switch + real exit execution built (session 9), UNEXERCISED
   against a real order.** Resting stop-loss orders, real TP/max-hold
   sell execution, and overnight reconciliation are all implemented and
@@ -708,9 +773,11 @@ caveat resolved first (see Open Items).
   sets). Before ever flipping `PAPER_MODE=false`: place one tiny manual
   real order first and confirm the stop-loss mechanism behaves as
   expected — do not trust this code at full size on the strength of
-  mocks alone. `RISK_PER_TRADE` is still 25% (unchanged, out of scope
-  for session 9) — needs to come down before real capital regardless of
-  how the exit-execution code performs.
+  mocks alone. `KILL_SWITCH_DRAWDOWN=15%` was calibrated for the OLD 25%
+  sizing (~7x margin over backtest's realized 2.21% drawdown) — at the
+  new 1% sizing the same historical drawdown is ~0.09%, so the kill
+  switch is a much looser backstop now than when it was tuned; revisit
+  if that margin ever matters.
 - **Model dormancy DIAGNOSED (session 7) and MITIGATED (session 8)** —
   root cause: two real crash outliers (Feb, June 2026) destabilizing an
   already-overfit XGBoost. Winsorizing + XGB regularization implemented,
