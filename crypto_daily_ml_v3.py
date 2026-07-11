@@ -126,6 +126,15 @@ TAKER_FEE        = 0.0026        # v4 removed post-only (oflags:post), so entry
                                  # fills as taker, not maker — fee must match
 MIN_ORDER_USDT   = 15.0          # Kraken minimum order value
 
+KILL_SWITCH_DRAWDOWN = 0.15      # halt NEW entries if balance falls this far
+                                 # below its all-time peak (2-4x the backtest's
+                                 # historical max drawdown of -3.5% to -9%, so
+                                 # it triggers on genuine breakdown, not normal
+                                 # volatility). Existing positions still exit
+                                 # normally — halting only blocks new risk.
+                                 # Manual reset required (halted=false in
+                                 # DailyMeta) — deliberately no auto-resume.
+
 TRAIN_WINDOW     = 180
 MIN_WARMUP_DAYS  = 80            # raised from 60 — ensures 60 train + 20 val
 CANDLE_LIMIT     = 365
@@ -219,6 +228,65 @@ def save_balance(meta_ws, balance: float) -> None:
         meta_ws.append_row(['balance', str(round(balance, 4)), today])
     except Exception as e:
         logger.error(f'Save balance failed: {e}')
+
+# ─────────────────────────────────────────────────────────────
+# KILL SWITCH — halt new entries on a large drawdown from peak balance
+# ─────────────────────────────────────────────────────────────
+def load_kill_switch_state(meta_ws) -> tuple:
+    """
+    Returns (peak_balance, halted). peak_balance defaults to
+    STARTING_BALANCE if never set. halted defaults to False.
+    """
+    if meta_ws is None:
+        return STARTING_BALANCE, False
+    try:
+        rows = meta_ws.get_all_records()
+        peak = STARTING_BALANCE
+        halted = False
+        for row in rows:
+            if row.get('key') == 'peak_balance' and str(row.get('value', '')).strip():
+                peak = float(row['value'])
+            elif row.get('key') == 'halted':
+                halted = str(row.get('value', '')).strip().lower() == 'true'
+        return peak, halted
+    except Exception as e:
+        logger.error(f'Load kill-switch state failed: {e} — assuming not halted')
+        return STARTING_BALANCE, False
+
+
+def save_kill_switch_state(meta_ws, peak_balance: float, halted: bool) -> None:
+    """Persist peak_balance and halted to Sheets Meta tab (same key/value/updated shape as balance)."""
+    if meta_ws is None:
+        return
+    try:
+        rows  = meta_ws.get_all_values()
+        today = datetime.now(timezone.utc).isoformat()
+        seen  = {'peak_balance': False, 'halted': False}
+        new_values = {'peak_balance': str(round(peak_balance, 4)), 'halted': str(halted)}
+        for i, row in enumerate(rows):
+            if row and row[0] in new_values:
+                meta_ws.update(range_name=f'A{i+1}:C{i+1}',
+                               values=[[row[0], new_values[row[0]], today]])
+                seen[row[0]] = True
+        for key, seen_flag in seen.items():
+            if not seen_flag:
+                meta_ws.append_row([key, new_values[key], today])
+    except Exception as e:
+        logger.error(f'Save kill-switch state failed: {e}')
+
+
+def check_kill_switch(balance: float, peak_balance: float) -> tuple:
+    """
+    Compares current balance against the all-time peak. Returns
+    (new_peak_balance, should_halt, drawdown_pct). should_halt is True
+    once drawdown crosses KILL_SWITCH_DRAWDOWN — caller is responsible
+    for persisting halted=True and for NOT auto-clearing it (manual
+    reset by design, see KILL_SWITCH_DRAWDOWN comment).
+    """
+    new_peak = max(balance, peak_balance)
+    drawdown = (new_peak - balance) / new_peak if new_peak > 0 else 0.0
+    should_halt = drawdown >= KILL_SWITCH_DRAWDOWN
+    return new_peak, should_halt, drawdown
 
 # ─────────────────────────────────────────────────────────────
 # DATA FETCHING
@@ -888,6 +956,12 @@ def run():
     balance = load_balance(meta_ws)
     logger.info(f'Balance loaded: ${balance:.2f}')
 
+    peak_balance, halted = load_kill_switch_state(meta_ws)
+    if halted:
+        logger.warning(f'  KILL SWITCH ACTIVE — new entries blocked '
+                        f'(balance=${balance:.2f} peak=${peak_balance:.2f}). '
+                        f'Manual reset required (set halted=false in DailyMeta).')
+
     exchange = ccxt.kraken({
         'apiKey':          os.environ.get('KRAKEN_API_KEY', ''),
         'secret':          os.environ.get('KRAKEN_SECRET', ''),
@@ -927,6 +1001,18 @@ def run():
     # FIX BUG 1: persist updated balance after exits
     save_balance(meta_ws, balance)
 
+    # ── Kill switch: re-evaluate drawdown against the updated balance ──
+    # Checked here (post-exit, pre-entry) so a today's-exits loss can
+    # trip the halt before any new entries are considered.
+    peak_balance, should_halt, drawdown = check_kill_switch(balance, peak_balance)
+    if should_halt and not halted:
+        halted = True
+        logger.error(f'  KILL SWITCH TRIPPED — drawdown {drawdown*100:.1f}% >= '
+                     f'{KILL_SWITCH_DRAWDOWN*100:.0f}% threshold '
+                     f'(balance=${balance:.2f} peak=${peak_balance:.2f}). '
+                     f'New entries halted until manually reset.')
+    save_kill_switch_state(meta_ws, peak_balance, halted)
+
     # ── Generate ML signals ───────────────────────────────────
     logger.info('\nGenerating signals...')
     closed_syms = {p['symbol'] for p in to_close}
@@ -959,6 +1045,14 @@ def run():
         in_pos_now = sym in active_syms
 
         # ── Determine reject reason for signal log ────────────
+        if halted:
+            reject = 'KILL_SWITCH_HALTED'
+            logger.info(f'  {sym}: kill switch active — new entries blocked')
+            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+                       feats_row, signal_fired=False, reject_reason=reject,
+                       in_position=in_pos_now)
+            continue
+
         if n_open >= MAX_POSITIONS:
             reject = 'MAX_POSITIONS'
             logger.info(f'  {sym}: max positions ({n_open}/{MAX_POSITIONS})')
@@ -1028,6 +1122,9 @@ def run():
     logger.info(f'  Balance    : ${balance:.2f}  '
                 f'(start=${STARTING_BALANCE:.2f} '
                 f'PnL={balance-STARTING_BALANCE:+.2f})')
+    logger.info(f'  Kill switch: {"HALTED" if halted else "ok"}  '
+                f'(peak=${peak_balance:.2f} drawdown={drawdown*100:.1f}% '
+                f'threshold={KILL_SWITCH_DRAWDOWN*100:.0f}%)')
     logger.info(f'  Exits      : {len(to_close)} | New entries: '
                 f'{n_open - (len(open_positions)-len(to_close))} | '
                 f'Open: {n_open}/{MAX_POSITIONS}')
