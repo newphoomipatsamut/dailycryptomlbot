@@ -114,6 +114,18 @@ dangerous kind of scope creep for a change like this). Instead:
   blind), and both sentinel/empty stop_order_id states (must never
   query the exchange for these). All passed.
 
+**Real-Sheet verification caught a real bug the mocks couldn't** —
+`workflow_dispatch` run `29149338929` failed the header patch with
+`Range (DailyTrades!R1) exceeds grid limits` (didn't crash the run, but
+`stop_order_id`/`fill_qty` never got added). Root cause: the live sheet's
+grid was still its original 16 columns; `get_or_create()`'s `cols=`
+argument only sets width on a brand-new sheet, not an existing one. Fixed
+by explicitly resizing before patching headers (`e277f76`), re-verified
+clean on `workflow_dispatch` run `29149415483` (no error, header patch
+silent-success, kill switch and exit/entry logic all correct). This is
+exactly the category of bug mocks can't catch — worth remembering next
+time a Sheet schema change looks "obviously fine" locally.
+
 **LABEL THIS UNEXERCISED until validated against one small real order.**
 Structurally correct + fail-safe + mock-tested is the ceiling reachable
 without real capital or credentials. Three real bugs were caught and
