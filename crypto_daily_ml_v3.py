@@ -430,6 +430,18 @@ FEATURE_COLS = [
 # ─────────────────────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────────────────────
+def winsorize_fit_apply(X_fit: np.ndarray, X_apply: np.ndarray,
+                         lower: float = 0.01, upper: float = 0.99) -> tuple:
+    """
+    Clip both arrays to per-column [lower, upper] percentiles computed from
+    X_fit only (no lookahead into X_apply). Caps single-day outlier rows
+    (e.g. a -10% crash day) from dominating tree splits / feature scaling.
+    """
+    lo = np.percentile(X_fit, lower * 100, axis=0)
+    hi = np.percentile(X_fit, upper * 100, axis=0)
+    return np.clip(X_fit, lo, hi), np.clip(X_apply, lo, hi)
+
+
 def train_and_predict(features_df: pd.DataFrame) -> dict:
     """
     Train RF + XGB on last TRAIN_WINDOW days, predict today.
@@ -457,6 +469,13 @@ def train_and_predict(features_df: pd.DataFrame) -> dict:
     X_tr     = X_all[:split];   y_tr = y_all[:split]
     X_val    = X_all[split:];   y_val= y_all[split:]
 
+    # Winsorize at 1st/99th percentile before scaling, fit on the training
+    # split only (no lookahead into val/today). Caps the influence of
+    # single-day crash outliers (e.g. the 2026-06-05 ETH -10.6% day) that
+    # were destabilizing XGB — see PROGRESS.md session 7.
+    X_tr, X_val = winsorize_fit_apply(X_tr, X_val)
+    X_all, X_today = winsorize_fit_apply(X_all, X_today)
+
     # Validation scaler — fit on training split only
     val_scaler   = StandardScaler()
     X_tr_sc      = val_scaler.fit_transform(X_tr)
@@ -479,10 +498,16 @@ def train_and_predict(features_df: pd.DataFrame) -> dict:
     rf_prob = float(rf.predict_proba(X_tod_sc)[0][1])
 
     # ── XGBoost / GradientBoosting fallback ───────────────────
+    # reg_lambda/min_child_weight/gamma added to curb overfitting on a
+    # 180-row/28-feature window — unregularized XGB was producing a
+    # bimodal, unstable probability distribution (std~0.39) every month
+    # checked back to March, not just during the recent crash. See
+    # PROGRESS.md session 7.
     if HAS_XGB:
         model = XGBClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8,
+            reg_lambda=5.0, min_child_weight=5, gamma=0.5,
             eval_metric='logloss', random_state=42, verbosity=0,
         )
     else:
