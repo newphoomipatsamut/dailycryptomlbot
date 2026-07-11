@@ -5,6 +5,56 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-11 (session 5) — Bumped GitHub Actions off Node 20 before the daily cron breaks
+
+Two days after session 4, a check of the live runs surfaced one escalated
+item: the **Node.js 20 deprecation warning went from cosmetic to active**.
+GitHub EOL'd Node 20 in Apr 2026 and now forces these actions onto Node 24
+by default on every run, emitting a `##[warning]` that names the offenders
+by tag and points only at an `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION`
+escape hatch — i.e. hard removal is imminent, which would silently break
+the `00:05 UTC` daily cron.
+
+Live health otherwise: green. Runs `29138136084` (2026-07-11) and
+`29068214219` (2026-07-10) both succeeded; the latest shows a normal flat
+day (all three ML probs below threshold, 0 exits/entries, 0/3 open). The
+session-4 exit-check fix continues to behave as designed in production
+(runs land 3–4h into the UTC day, evaluating the most recently complete
+bar — exactly the case it was written for).
+
+**Fix (`.github/workflows/daily_ml.yml`, pushed as `c0ca1af`):**
+- `actions/checkout@v3` → `@v5`
+- `actions/setup-python@v4` → `@v6`
+
+Picked the earliest stable Node-24 majors, not the bleeding edge (checkout
+is now at v7, only ~3 weeks old — avoided on a live trading cron). Verified
+each tag's declared runtime directly from its own `action.yml` `using:`
+field rather than trusting secondhand advice:
+
+| Action | v4 | v5 | v6 | v7 |
+|---|---|---|---|---|
+| `actions/checkout`   | node20 | **node24** | node24 | node24 |
+| `actions/setup-python` | node16 | node20 | **node24** | — |
+
+`setup-python@v6` is the *only* node24 major, so that one was forced;
+`checkout@v5` was chosen as the smallest sufficient jump. Both are drop-ins
+for this workflow (no special inputs, `python-version: '3.10'`).
+
+**Verified end-to-end via `workflow_dispatch` (run `29142654357`):**
+completed/success, step list now reads `Run actions/checkout@v5`, and the
+full log has **zero** matches for `node 20` / `forced to run on Node` /
+`deprecat` / `##[warning]` — warning fully silenced. Bot logic ran normally
+(OFI gates evaluated, signals generated, sheet writes OK, no errors).
+
+**Explicitly not done:** no code change to `crypto_daily_ml_v3.py` or
+`backtest.py`; no strategy/threshold/model tuning (still on hold per
+session 1); did not act on the OFI finding (still waiting on more live
+data). The OFI live sample (n=20 as of session 3) has not meaningfully
+grown — the last several runs have been flat (no entries), so there's
+nothing new to re-run `analyze_live_ofi.py` against yet.
+
+---
+
 ## 2026-07-09 (session 4) — Fixed the same bug in the LIVE bot, refreshed all backtest numbers
 
 Session 3 found and fixed the entry-day trailing-stop bug in `backtest.py`
@@ -329,10 +379,10 @@ caveat resolved first (see Open Items).
   bar. If a live outcome ever looks surprising vs. what the backtest
   predicts going forward, this is no longer the likely cause; look
   elsewhere first.
-- **Node.js 20 deprecation warning in Actions logs** (from
-  `actions/checkout@v3` / `actions/setup-python@v4`) — unrelated to bot
-  code, cosmetic, not fixed. Bump to `@v4`/`@v5` if it starts actually
-  failing.
+- **Node.js 20 deprecation — RESOLVED in session 5** (`c0ca1af`):
+  escalated from cosmetic to an active `##[warning]` (GitHub now forces
+  Node 24). Bumped `checkout@v3`→`@v5`, `setup-python@v4`→`@v6` (verified
+  via each action's `action.yml` `using:` field). Warning gone, run clean.
 - Feature/threshold/model tuning is still explicitly on hold — don't
   start without asking first, per session-1 user direction (unchanged).
 - Bot is still `PAPER_MODE=true` in the workflow — no live capital at
