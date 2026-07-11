@@ -5,6 +5,81 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-11 (session 6) — Forward test (the go/no-go gate): NOT falsified, but NOT proven, and the model has gone dormant
+
+User asked "can this trade live yet — I've run paper since February." Ran
+the forward test (`forward_test.py`, new this session) comparing live
+realized paper P&L against the backtest's prediction over the SAME window,
+plus a buy-&-hold benchmark. Verdict: **not yet — three independent
+blockers**, the most urgent of which is a new finding.
+
+**The forward test, on the 10 real trades (exported DailyTrades CSV,
+window 2026-03-12 → 2026-05-04, 53 days):**
+
+| Metric            | LIVE (realized) | BACKTEST predicted (same window, no OFI) | Buy & hold ETH/SOL/LINK |
+|-------------------|----------------:|-----------------------------------------:|------------------------:|
+| Trades            | 10              | 15                                       | —                       |
+| Return            | +3.8%           | +3.1%                                    | +4.4%                   |
+| Win rate          | 60%             | 47%                                      | —                       |
+| Stop-losses       | 0               | 4                                        | —                       |
+| Max drawdown      | -0.2%           | -0.9%                                    | —                       |
+
+**What it says (the honest read):**
+1. **Bookkeeping is trustworthy.** 9/10 trades reconstruct identically via
+   `check_exit()` on real Kraken prices. The 1 mismatch (SOL 2026-04-28:
+   recorded `TRAIL_BE`, reconstructed `SL`) is exactly the documented
+   partial-bar timing artifact from sessions 3/4, not a bug. The recorded
+   live numbers are reliable.
+2. **Not falsified.** Live return (+3.8%) is in the same ballpark as the
+   backtest prediction (+3.1%) for the same window — the strategy roughly
+   performed as simulated. Good sign, weak.
+3. **But underperformed buy-&-hold** (+3.8% vs +4.4%) in the only window
+   tested. Despite a favorable 0-stop-loss run, simply holding the three
+   assets made more. (Partial excuse: the strategy is mostly in cash, so
+   in up-markets it structurally lags — its only possible edge is downside
+   protection, which this window didn't test.)
+4. **n=10.** The 60% win / 0 SL is consistent with luck. 95% CI on a 60%
+   win rate at n=10 spans ~26–88%; it's compatible with the backtest's
+   true ~40%. Trade-level validation also failed (only 1 of 10 live trades
+   overlapped with the FAST_MODE backtest's trade set — model-config
+   mismatch, so only the aggregate comparison is meaningful).
+
+**THE URGENT FINDING — the model has gone dormant:**
+- `SIGNAL_THRESHOLD = 0.60` to fire (crypto_daily_ml_v3.py:120).
+- The 10 trades that fired (Mar–Apr) had ensemble probs 0.611–0.757.
+- **Every run in the last week output probs of 0.09–0.29** — less than
+  half the firing threshold. Highest recent: 0.286.
+- Consequence: **zero trades since 2026-05-04 — over 2 months of
+  silence.** "Paper since February" is really "10 trades in a 7-week
+  Mar–Apr window, then the model stopped firing." Recent scheduled runs
+  all show 0 entries, 0/3 open.
+
+A model whose probability outputs have collapsed to ~25% of threshold is
+either (a) correctly sitting out an unfavorable regime, (b) suffering
+concept drift (rolling-retrain features no longer match reality), or
+(c) a data/feature break. Can't tell which without retraining locally
+and inspecting feature distributions. Regardless: a dormant model can't
+be validated and can't trade live.
+
+**Verdict on "can it trade live": NO.** Three independent blockers:
+1. Evidence is too thin (n=10, underperformed hold, see table).
+2. **Model appears dormant — needs diagnosis first** (most urgent).
+3. Mechanics still unsafe (no resting stop orders, no drawdown kill-switch,
+   25% position sizing — unchanged from session 5's assessment).
+
+**New tool committed: `forward_test.py`** — reusable. Loads an exported
+DailyTrades CSV, reconstructs each trade's expected outcome (fidelity),
+compares live vs backtest-predicted aggregates over the live window, and
+benchmarks against equal-weight buy-&-hold. Re-run as live history grows:
+`python forward_test.py --trades DailyTrades.csv --src kraken`.
+
+**Explicitly not done:** did not diagnose the model dormancy (recommended
+next step — retrain locally, inspect feature/prob distributions; does not
+touch strategy). Did not run the FAST_MODE=False multi-regime backtest.
+Did not add safety rails. Did not flip PAPER_MODE.
+
+---
+
 ## 2026-07-11 (session 5) — Bumped GitHub Actions off Node 20 before the daily cron breaks
 
 Two days after session 4, a check of the live runs surfaced one escalated
@@ -358,6 +433,18 @@ caveat resolved first (see Open Items).
 
 ## Open items / where to pick up next
 
+- **URGENT (session 6): the live model has gone dormant — diagnose why
+  before anything else.** Zero trades since 2026-05-04; every recent run
+  outputs ensemble probs 0.09–0.29 against a 0.60 fire threshold. Need to
+  retrain locally on current data and inspect feature values / probability
+  outputs to tell genuine-no-conviction from concept drift or a data break.
+  A dormant model can't be validated or traded live. Does not touch
+  strategy — this is "is the bot even working."
+- **Forward test verdict is in (session 6): NOT ready for live capital.**
+  n=10 trades underperformed buy-&-hold (+3.8% vs +4.4%); bookkeeping is
+  trustworthy (9/10 fidelity) but the evidence is too thin and the model is
+  dormant. Re-run `forward_test.py` as live history grows — but history
+  won't grow until the dormancy above is resolved.
 - **Re-run `analyze_live_ofi.py` periodically as live history grows.**
   n=20 as of 2026-07-09 is not enough to trust the OFI-gate finding
   either direction (real data currently suggests the gate filters for
