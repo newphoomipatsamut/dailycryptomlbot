@@ -66,7 +66,12 @@ logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 SYMBOLS           = ['ETH/USDT', 'SOL/USDT', 'LINK/USDT']
-RISK_PER_TRADE    = 0.25
+RISK_PER_TRADE    = 0.01   # matches live (lowered from 0.25 in session 10 —
+                           # see crypto_daily_ml_v3.py for rationale). NOTE:
+                           # CAGR/Sharpe/drawdown are NOT comparable to any
+                           # backtest run before this change — they scale
+                           # with position size. Win rate/PF/trade count are
+                           # still comparable (sizing-independent).
 TAKE_PROFIT_PCT   = 0.030
 STOP_LOSS_PCT     = 0.010
 MAX_HOLD_DAYS     = 5

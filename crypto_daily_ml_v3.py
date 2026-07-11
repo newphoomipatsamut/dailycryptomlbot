@@ -9,6 +9,14 @@ Why daily vs tick scalping:
   - OFI correctly predicted direction 92% on tick data
   - On daily bars, RSI + ATR + EMA + momentum = strong signal set
 
+v6 (real-capital readiness, session 9-10):
+  [RISK]  Added resting stop-loss orders, real TP/max-hold sell execution,
+          and a drawdown kill switch — previously exits were pure paper
+          bookkeeping with no real sell ever placed. UNEXERCISED against
+          a real order — see PROGRESS.md session 9 before trusting at size.
+  [CONFIG] RISK_PER_TRADE lowered 25% → 1% (see below) — 25% was a
+          backtest-era choice never meant for live capital.
+
 v5 fixes (from live-data audit):
   [BUG]   check_exits() checked TP/SL against "today's" daily bar, which is
           still partial when the bot runs (GitHub Actions scheduled runs
@@ -58,7 +66,9 @@ Strategy:
   - TP=3% (vs daily HIGH), SL=1% (vs daily LOW), max hold 5 days
 
 Position sizing:
-  - Trade size: 25% of balance per signal
+  - Trade size: 1% of balance per signal (RISK_PER_TRADE — lowered from
+    25% in session 10 for real-capital readiness; 25% was validated
+    against backtest metrics, not sized for real money)
   - Max 3 concurrent positions (one per symbol)
   - TP: 3%  SL: 1%  Max hold: 5 days
 
@@ -112,7 +122,14 @@ SYMBOLS          = ['ETH/USDT', 'SOL/USDT', 'LINK/USDT']
 
 PAPER_MODE       = os.environ.get('PAPER_MODE', 'true').lower() == 'true'
 STARTING_BALANCE = float(os.environ.get('PAPER_BALANCE', 10000.0))
-RISK_PER_TRADE   = 0.25          # raised from 0.10 — validated by backtest
+RISK_PER_TRADE   = 0.01          # lowered from 0.25 for real-capital readiness
+                                 # (session 10) — 25% was a backtest-sizing
+                                 # choice never meant for live capital: n=10
+                                 # live trades is too thin to trust, and the
+                                 # session-9 stop-loss/exit-execution code is
+                                 # still unexercised against a real order.
+                                 # Revisit upward only once both have more
+                                 # runway. See PROGRESS.md session 10.
 TAKE_PROFIT_PCT  = 0.030
 STOP_LOSS_PCT    = 0.010
 MAX_HOLD_DAYS    = 5
