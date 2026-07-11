@@ -180,8 +180,15 @@ def init_sheets():
         # cost a label, but load_open_positions()/reconciliation read both
         # by column name via get_all_records(), so headers must be present.
         # Idempotent across repeated 17->18->19 width migrations — each
-        # column is checked/patched independently.
+        # column is checked/patched independently. get_or_create() only
+        # sets col_count on a BRAND NEW sheet — an existing sheet keeps
+        # its original grid width regardless of the `cols` arg above, so
+        # the grid must be explicitly resized before writing past its
+        # current bound (confirmed live: writing R1 on a 16-col grid
+        # raised "Range exceeds grid limits" — see PROGRESS.md session 9).
         try:
+            if trades_ws.col_count < 19:
+                trades_ws.resize(cols=19)
             existing_header = trades_ws.row_values(1)
             if 'stop_order_id' not in existing_header:
                 trades_ws.update(range_name='R1', values=[['stop_order_id']])
