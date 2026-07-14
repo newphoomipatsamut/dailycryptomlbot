@@ -5,6 +5,65 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-14 (session 11) — Replaced Google Sheets with git-committed CSV/JSON
+
+User asked which was better for their workflow, Sheets or CSV — recommended
+CSV given the recurring "no local API/OAuth access to the Sheet, export
+manually" friction hit in sessions 3, 6, and every `analyze_live_ofi.py` /
+`forward_test.py` run since. User approved, implemented.
+
+Replaced `gspread`/`google-auth` entirely. `init_sheets()` -> `init_store()`:
+writes `DailyTrades.csv`, `DailySignals.csv`, `DailyMeta.json` to the repo
+root (same column names/shapes as the old Sheets tabs, so `forward_test.py`
+and `analyze_live_ofi.py` needed zero changes — verified by parsing a
+freshly-generated `DailyTrades.csv` through `forward_test.load_live_trades()`
+directly). `DailyMeta` tab (key/value/updated rows) became a flat JSON dict
+(`balance`, `peak_balance`, `halted`, plus `_updated` timestamps) — simpler
+than reproducing the row-scan/patch logic gspread needed. All read/write
+call sites (`load_balance`, `save_balance`, `load_kill_switch_state`,
+`save_kill_switch_state`, `load_open_positions`, `log_signal`, `log_entry`,
+`log_exit`) ported to plain `csv`/`json` module calls; `log_exit`'s
+row_id-match-and-rewrite logic preserved exactly (read all rows, replace the
+matching row, rewrite the file — CSV has no in-place cell update, so this
+mirrors the old gspread range-write, just at file granularity).
+
+Workflow (`daily_ml.yml`): dropped `GOOGLE_CREDS_JSON`/`GOOGLE_SHEET_ID`
+secrets, added `permissions: contents: write` + a commit-state-back step
+mirroring `tjr_trading`'s `paper_trades.csv` pattern (`git add` the 3
+files, commit only if changed, `pull --rebase` then `push`). Confirmed
+`DailyTrades.csv`/`DailySignals.csv`/`DailyMeta.json` don't collide with
+any existing `.gitignore` pattern (checked via `fnmatch` against all 3
+patterns — no match), so they'll actually get committed, unlike the
+`backtest_*.csv` outputs which are intentionally ignored.
+
+Verified before considering this done (no test suite exists in this repo,
+so this was manual, per PROGRESS.md's stated verification norm):
+1. Isolated unit-level round-trip test (balance load/save, kill-switch
+   load/save, log_entry -> log_exit matched-by-row_id rewrite, 2-position
+   open/close-one scenario confirming the other position stays open and
+   uncorrupted) — all passed, checked output CSV/JSON content by eye.
+2. Full `python crypto_daily_ml_v3.py` run in `PAPER_MODE=true` against
+   real Kraken/Fear&Greed data end-to-end (not mocked) — completed clean,
+   correctly logged all 3 symbols as `PROB_TOO_LOW` rejects (consistent
+   with the session 7-8 dormancy finding, still dormant as of this run),
+   balance/kill-switch state written correctly to `DailyMeta.json`.
+3. `forward_test.load_live_trades()` parsed the freshly-generated
+   `DailyTrades.csv` directly with zero code changes — column-shape
+   compatibility confirmed, not just assumed.
+
+Removed `gspread>=6.0.0` / `google-auth>=2.20.0` from
+`requirements_daily.txt`. No strategy/model/threshold changes — this was
+purely a state-store swap, scoped exactly as asked.
+
+**Not done / didn't touch:** the live Google Sheet itself (if the user
+still wants to glance at history there, it's now stale — nothing writes
+to it anymore). No migration script written to backfill the new CSVs from
+the old Sheet's history; if that history matters, export it once manually
+and prepend to `DailyTrades.csv`/`DailySignals.csv` before the next cron
+run overwrites expectations about "first run".
+
+---
+
 ## 2026-07-11 (session 10) — Lowered position sizing 25% → 1% for real-capital readiness
 
 User asked to bring position sizing down to 1-2% risk per trade — the
@@ -847,8 +906,12 @@ caveat resolved first (see Open Items).
 
 - `crypto_daily_ml_v3.py` — the live/paper bot, run daily via
   `.github/workflows/daily_ml.yml` (cron `5 0 * * *` UTC +
-  `workflow_dispatch`). Reads/writes state to a Google Sheet
-  (`DailyTrades`, `DailySignals`, `DailyMeta` tabs) via `gspread`.
+  `workflow_dispatch`). Reads/writes state to `DailyTrades.csv` /
+  `DailySignals.csv` / `DailyMeta.json` in the repo root (as of session 11
+  — was a Google Sheet via `gspread` before that); the workflow commits
+  these back to the repo each run, same pattern as `tjr_trading`'s
+  `paper_trades.csv`. `git pull` gets fresh data directly — no manual
+  export step needed anymore for `forward_test.py` / `analyze_live_ofi.py`.
 - `backtest.py` — standalone walk-forward simulator, same features/model/
   exit logic as live, run locally (`python backtest.py`), not part of CI.
   `DATA_SOURCE` env var picks the price source (`binance` default, deep
@@ -857,11 +920,13 @@ caveat resolved first (see Open Items).
   trade-flow-imbalance proxy for the OFI gate — not the same metric as
   live's order-book snapshot, see module docstring.
 - `analyze_live_ofi.py` — compares real live OFI-gate outcomes (passed
-  vs. blocked) using exported `DailySignals`/`DailyTrades` CSVs. This is
-  the ground-truth check for the OFI question, separate from and more
+  vs. blocked) using `DailySignals.csv`/`DailyTrades.csv` (`git pull` for
+  the latest, no export needed since session 11). This is the
+  ground-truth check for the OFI question, separate from and more
   trustworthy than `backtest.py`'s Binance proxy. See its docstring for
   usage and caveats (sample size, partial-bar timing).
-- `requirements_daily.txt` — deps for all three scripts.
+- `requirements_daily.txt` — deps for both scripts (no longer 3 — Sheets
+  deps dropped in session 11).
 - No test suite exists. Verification so far has been: `py_compile`,
   manual `workflow_dispatch` runs, manually recomputing backtest metrics
   from output CSVs, and cross-checking new logic (OFI proxy, live-OFI

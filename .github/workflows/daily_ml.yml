@@ -5,6 +5,9 @@ on:
     - cron: '5 0 * * *'   # runs 00:05 UTC every day
   workflow_dispatch:        # allows manual run from GitHub UI
 
+permissions:
+  contents: write            # needed to commit state + trade log back to repo
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -24,8 +27,21 @@ jobs:
         env:
           KRAKEN_API_KEY:    ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_SECRET:     ${{ secrets.KRAKEN_SECRET }}
-          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
-          GOOGLE_SHEET_ID:   ${{ secrets.GOOGLE_SHEET_ID }}
           PAPER_MODE:        "true"
           PAPER_BALANCE:     "10000"
         run: python crypto_daily_ml_v3.py
+
+      - name: Commit state and trade log
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          [ -f DailyTrades.csv ]  && git add DailyTrades.csv
+          [ -f DailySignals.csv ] && git add DailySignals.csv
+          [ -f DailyMeta.json ]   && git add DailyMeta.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: daily ml bot run $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase origin $(git rev-parse --abbrev-ref HEAD) 2>/dev/null || true
+            git push
+          fi

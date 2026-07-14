@@ -77,22 +77,32 @@ Kraken has for these USDT pairs, OFI gate disabled — an upper-bound estimate,
 not a live-equivalent number). Treat any "expected return" figure as
 unverified until backed by a FAST_MODE=False backtest run.
 
+v7 (state store: Google Sheets -> git-committed CSV/JSON):
+  Every prior session needing to analyze live results (OFI-gate check,
+  forward_test.py) required a manual "export the Sheet to CSV and hand me
+  the path" round-trip, since there was no local API/OAuth access to the
+  Sheet. Replaced gspread with DailyTrades.csv / DailySignals.csv /
+  DailyMeta.json written to the repo root and committed back by the GH
+  Actions workflow each run (same pattern as tjr_trading's paper_trades.csv)
+  -- `git pull` now gets fresh data with no export step, and no
+  GOOGLE_CREDS_JSON secret to manage. Column names/shapes unchanged, so
+  forward_test.py / analyze_live_ofi.py work unmodified against these files.
+
 Setup:
-  pip install ccxt pandas numpy scikit-learn xgboost gspread google-auth
+  pip install ccxt pandas numpy scikit-learn xgboost
 
 Environment variables:
-  KRAKEN_API_KEY, KRAKEN_SECRET, GOOGLE_CREDS_JSON, GOOGLE_SHEET_ID
+  KRAKEN_API_KEY, KRAKEN_SECRET
   PAPER_MODE  ('true' default), PAPER_BALANCE (default 10000)
 """
 
-import os, json, logging, urllib.request
+import csv, os, json, logging, urllib.request
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import ccxt
-import gspread
-from google.oauth2.service_account import Credentials
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
@@ -157,162 +167,104 @@ MIN_WARMUP_DAYS  = 80            # raised from 60 — ensures 60 train + 20 val
 CANDLE_LIMIT     = 365
 
 # ─────────────────────────────────────────────────────────────
-# GOOGLE SHEETS
+# STORE — git-committed CSV/JSON (replaces Google Sheets, see v7 note)
 # ─────────────────────────────────────────────────────────────
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
+DATA_DIR = Path(__file__).parent
+
+TRADES_CSV_HEADER = [
+    'row_id', 'date', 'symbol', 'action', 'entry_price', 'exit_price',
+    'pnl_gross', 'pnl_net', 'fees', 'reason',
+    'hold_days', 'win', 'balance_after',
+    'signal_prob', 'rf_prob', 'xgb_prob', 'trade_size', 'stop_order_id',
+    'fill_qty',
+]
+SIGNALS_CSV_HEADER = [
+    'date', 'symbol', 'close', 'ensemble_prob', 'rf_prob', 'xgb_prob',
+    'signal_fired', 'reject_reason', 'ofi_value', 'ofi_gate_pass',
+    'rsi', 'atr_pct', 'in_position',
 ]
 
-def init_sheets():
+def init_store():
+    """
+    Ensure DailyTrades.csv / DailySignals.csv / DailyMeta.json exist (with
+    header, if new) in the repo root and return their paths. The GH Actions
+    workflow commits these back after every run — same restart-safe,
+    git-as-database pattern as tjr_trading's paper_trades.csv. Column names
+    are unchanged from the old Sheets tabs, so forward_test.py /
+    analyze_live_ofi.py (which parse exported-CSV shapes) work unmodified.
+    """
+    trades_path  = DATA_DIR / 'DailyTrades.csv'
+    signals_path = DATA_DIR / 'DailySignals.csv'
+    meta_path    = DATA_DIR / 'DailyMeta.json'
+
+    if not trades_path.exists():
+        with open(trades_path, 'w', newline='') as f:
+            csv.writer(f).writerow(TRADES_CSV_HEADER)
+    if not signals_path.exists():
+        with open(signals_path, 'w', newline='') as f:
+            csv.writer(f).writerow(SIGNALS_CSV_HEADER)
+    if not meta_path.exists():
+        meta_path.write_text('{}')
+
+    logger.info(f'Store ready: {trades_path.name}, {signals_path.name}, {meta_path.name}')
+    return trades_path, signals_path, meta_path
+
+
+def _load_meta(meta_path) -> dict:
     try:
-        creds_json = os.environ.get('GOOGLE_CREDS_JSON')
-        if not creds_json:
-            logger.warning('GOOGLE_CREDS_JSON not set — Sheets disabled')
-            return None, None, None, None
-
-        creds  = Credentials.from_service_account_info(
-                     json.loads(creds_json), scopes=SCOPES)
-        client = gspread.authorize(creds)
-        ss     = client.open_by_key(os.environ.get('GOOGLE_SHEET_ID'))
-
-        def get_or_create(name, rows, cols, headers):
-            try:
-                return ss.worksheet(name)
-            except gspread.WorksheetNotFound:
-                ws = ss.add_worksheet(name, rows=rows, cols=cols)
-                ws.append_row(headers)
-                return ws
-
-        trades_ws  = get_or_create('DailyTrades', 5000, 19, [
-            'row_id', 'date', 'symbol', 'action', 'entry_price', 'exit_price',
-            'pnl_gross', 'pnl_net', 'fees', 'reason',
-            'hold_days', 'win', 'balance_after',
-            'signal_prob', 'rf_prob', 'xgb_prob', 'trade_size', 'stop_order_id',
-            'fill_qty',
-        ])
-        # Sheet may pre-date the stop_order_id/fill_qty columns (R, S) —
-        # patch headers in place if an existing sheet is missing them. New
-        # rows always write the full width; a missing header would only
-        # cost a label, but load_open_positions()/reconciliation read both
-        # by column name via get_all_records(), so headers must be present.
-        # Idempotent across repeated 17->18->19 width migrations — each
-        # column is checked/patched independently. get_or_create() only
-        # sets col_count on a BRAND NEW sheet — an existing sheet keeps
-        # its original grid width regardless of the `cols` arg above, so
-        # the grid must be explicitly resized before writing past its
-        # current bound (confirmed live: writing R1 on a 16-col grid
-        # raised "Range exceeds grid limits" — see PROGRESS.md session 9).
-        try:
-            if trades_ws.col_count < 19:
-                trades_ws.resize(cols=19)
-            existing_header = trades_ws.row_values(1)
-            if 'stop_order_id' not in existing_header:
-                trades_ws.update(range_name='R1', values=[['stop_order_id']])
-            if 'fill_qty' not in existing_header:
-                trades_ws.update(range_name='S1', values=[['fill_qty']])
-        except Exception as e:
-            logger.error(f'DailyTrades header patch failed: {e}')
-        signals_ws = get_or_create('DailySignals', 50000, 13, [
-            'date', 'symbol', 'close', 'ensemble_prob', 'rf_prob', 'xgb_prob',
-            'signal_fired', 'reject_reason', 'ofi_value', 'ofi_gate_pass',
-            'rsi', 'atr_pct', 'in_position',
-        ])
-        # FIX BUG 1: Meta tab stores persistent balance
-        meta_ws    = get_or_create('DailyMeta', 100, 3, [
-            'key', 'value', 'updated'
-        ])
-
-        logger.info('Google Sheets connected')
-        return client, trades_ws, signals_ws, meta_ws
-
+        return json.loads(Path(meta_path).read_text())
     except Exception as e:
-        logger.error(f'Sheets init failed: {e}')
-        return None, None, None, None
+        logger.error(f'Load meta failed: {e} — starting from empty state')
+        return {}
+
+
+def _save_meta(meta_path, meta: dict) -> None:
+    try:
+        Path(meta_path).write_text(json.dumps(meta, indent=2, sort_keys=True))
+    except Exception as e:
+        logger.error(f'Save meta failed: {e}')
 
 # ─────────────────────────────────────────────────────────────
 # FIX BUG 1: PERSISTENT BALANCE
 # ─────────────────────────────────────────────────────────────
-def load_balance(meta_ws) -> float:
-    """Load current balance from Sheets Meta tab. Falls back to STARTING_BALANCE."""
-    if meta_ws is None:
-        return STARTING_BALANCE
-    try:
-        rows = meta_ws.get_all_records()
-        for row in rows:
-            if row.get('key') == 'balance':
-                val = float(row['value'])
-                logger.info(f'Loaded balance from Sheets: ${val:.2f}')
-                return val
-        # First run — initialise
-        meta_ws.append_row(['balance', str(STARTING_BALANCE),
-                             datetime.now(timezone.utc).isoformat()])
-        logger.info(f'Balance initialised: ${STARTING_BALANCE:.2f}')
-        return STARTING_BALANCE
-    except Exception as e:
-        logger.error(f'Load balance failed: {e} — using STARTING_BALANCE')
-        return STARTING_BALANCE
+def load_balance(meta_path) -> float:
+    """Load current balance from DailyMeta.json. Falls back to STARTING_BALANCE."""
+    meta = _load_meta(meta_path)
+    if 'balance' in meta:
+        val = float(meta['balance'])
+        logger.info(f'Loaded balance from store: ${val:.2f}')
+        return val
+    logger.info(f'Balance initialised: ${STARTING_BALANCE:.2f}')
+    return STARTING_BALANCE
 
-def save_balance(meta_ws, balance: float) -> None:
-    """Persist current balance to Sheets Meta tab."""
-    if meta_ws is None:
-        return
-    try:
-        rows  = meta_ws.get_all_values()
-        today = datetime.now(timezone.utc).isoformat()
-        for i, row in enumerate(rows):
-            if row and row[0] == 'balance':
-                meta_ws.update(range_name=f'A{i+1}:C{i+1}',
-                               values=[['balance', str(round(balance, 4)), today]])
-                return
-        meta_ws.append_row(['balance', str(round(balance, 4)), today])
-    except Exception as e:
-        logger.error(f'Save balance failed: {e}')
+def save_balance(meta_path, balance: float) -> None:
+    """Persist current balance to DailyMeta.json."""
+    meta = _load_meta(meta_path)
+    meta['balance'] = round(balance, 4)
+    meta['balance_updated'] = datetime.now(timezone.utc).isoformat()
+    _save_meta(meta_path, meta)
 
 # ─────────────────────────────────────────────────────────────
 # KILL SWITCH — halt new entries on a large drawdown from peak balance
 # ─────────────────────────────────────────────────────────────
-def load_kill_switch_state(meta_ws) -> tuple:
+def load_kill_switch_state(meta_path) -> tuple:
     """
     Returns (peak_balance, halted). peak_balance defaults to
     STARTING_BALANCE if never set. halted defaults to False.
     """
-    if meta_ws is None:
-        return STARTING_BALANCE, False
-    try:
-        rows = meta_ws.get_all_records()
-        peak = STARTING_BALANCE
-        halted = False
-        for row in rows:
-            if row.get('key') == 'peak_balance' and str(row.get('value', '')).strip():
-                peak = float(row['value'])
-            elif row.get('key') == 'halted':
-                halted = str(row.get('value', '')).strip().lower() == 'true'
-        return peak, halted
-    except Exception as e:
-        logger.error(f'Load kill-switch state failed: {e} — assuming not halted')
-        return STARTING_BALANCE, False
+    meta = _load_meta(meta_path)
+    peak   = float(meta['peak_balance']) if str(meta.get('peak_balance', '')).strip() else STARTING_BALANCE
+    halted = str(meta.get('halted', '')).strip().lower() == 'true'
+    return peak, halted
 
 
-def save_kill_switch_state(meta_ws, peak_balance: float, halted: bool) -> None:
-    """Persist peak_balance and halted to Sheets Meta tab (same key/value/updated shape as balance)."""
-    if meta_ws is None:
-        return
-    try:
-        rows  = meta_ws.get_all_values()
-        today = datetime.now(timezone.utc).isoformat()
-        seen  = {'peak_balance': False, 'halted': False}
-        new_values = {'peak_balance': str(round(peak_balance, 4)), 'halted': str(halted)}
-        for i, row in enumerate(rows):
-            if row and row[0] in new_values:
-                meta_ws.update(range_name=f'A{i+1}:C{i+1}',
-                               values=[[row[0], new_values[row[0]], today]])
-                seen[row[0]] = True
-        for key, seen_flag in seen.items():
-            if not seen_flag:
-                meta_ws.append_row([key, new_values[key], today])
-    except Exception as e:
-        logger.error(f'Save kill-switch state failed: {e}')
+def save_kill_switch_state(meta_path, peak_balance: float, halted: bool) -> None:
+    """Persist peak_balance and halted to DailyMeta.json (same key shape as before)."""
+    meta = _load_meta(meta_path)
+    meta['peak_balance'] = round(peak_balance, 4)
+    meta['halted'] = str(halted)
+    meta['kill_switch_updated'] = datetime.now(timezone.utc).isoformat()
+    _save_meta(meta_path, meta)
 
 
 def check_kill_switch(balance: float, peak_balance: float) -> tuple:
@@ -654,15 +606,24 @@ def train_and_predict(features_df: pd.DataFrame) -> dict:
 # ─────────────────────────────────────────────────────────────
 # POSITION MANAGEMENT
 # ─────────────────────────────────────────────────────────────
-def load_open_positions(trades_ws) -> list:
+def _read_csv_rows(path) -> list:
+    """dict-per-row read of a store CSV, mirroring gspread's get_all_records()."""
+    try:
+        with open(path, newline='') as f:
+            return list(csv.DictReader(f))
+    except FileNotFoundError:
+        return []
+
+
+def load_open_positions(trades_path) -> list:
     """
-    Load open positions from Sheets.
-    FIX MINOR: only scans last 90 days (not entire sheet history).
+    Load open positions from DailyTrades.csv.
+    FIX MINOR: only scans last 90 days (not entire file history).
     """
-    if trades_ws is None:
+    if trades_path is None:
         return []
     try:
-        rows     = trades_ws.get_all_records()
+        rows     = _read_csv_rows(trades_path)
         cutoff   = (datetime.now(timezone.utc) - timedelta(days=90)).strftime('%Y-%m-%d')
         open_pos = [
             r for r in rows
@@ -682,7 +643,7 @@ def reconcile_stop_fills(exchange, open_positions: list, today: str) -> tuple:
     stop-loss order id, ask the exchange whether it has filled overnight
     (the exchange enforces the stop in real time; this daily run only
     learns about it after the fact). Must run BEFORE check_exits() —
-    check_exits() only knows about Sheet state and OHLCV, so a position
+    check_exits() only knows about store state and OHLCV, so a position
     the exchange already sold would otherwise get double-counted as
     still-open and re-evaluated for a phantom exit. See PROGRESS.md
     session 9.
@@ -881,23 +842,24 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
 # ─────────────────────────────────────────────────────────────
 # TRADE LOGGING
 # ─────────────────────────────────────────────────────────────
-def _next_row_id(trades_ws) -> str:
+def _next_row_id(trades_path) -> str:
     """Generate a unique row ID for each trade entry."""
     try:
-        n = len(trades_ws.get_all_values())
+        with open(trades_path, newline='') as f:
+            n = sum(1 for _ in f)  # includes header, matching old get_all_values() count
         return f'T{n:04d}'
     except Exception:
         return f'T{int(datetime.now().timestamp())}'
 
-def log_signal(signals_ws, today: str, symbol: str,
+def log_signal(signals_path, today: str, symbol: str,
                close_px: float, signal: dict,
                ofi_val: float, features_row: pd.Series,
                signal_fired: bool, reject_reason: str,
                in_position: bool) -> None:
     """
-    Log every symbol's daily signal to DailySignals — even when no trade fires.
-    This is the rejection log: shows WHY each symbol didn't trade each day.
-    reject_reason values:
+    Log every symbol's daily signal to DailySignals.csv — even when no trade
+    fires. This is the rejection log: shows WHY each symbol didn't trade each
+    day. reject_reason values:
       NONE              — signal fired, trade entered
       PROB_TOO_LOW      — ensemble prob below SIGNAL_THRESHOLD
       OFI_NEGATIVE      — ML signal but OFI gate blocked entry
@@ -905,62 +867,64 @@ def log_signal(signals_ws, today: str, symbol: str,
       MAX_POSITIONS     — at max concurrent positions
       INSUFFICIENT_DATA — not enough bars to train
     """
-    if signals_ws is None:
+    if signals_path is None:
         return
     try:
-        signals_ws.append_row([
-            today,
-            symbol,
-            round(close_px, 6),
-            round(signal.get('ensemble_prob', 0), 4),
-            round(signal.get('rf_prob', 0), 4),
-            round(signal.get('xgb_prob', 0), 4),
-            signal_fired,
-            reject_reason,
-            round(ofi_val, 4),
-            'YES' if ofi_val > OFI_GATE else 'NO',
-            round(float(features_row.get('rsi', 0)), 2),
-            round(float(features_row.get('atr_pct', 0)) * 100, 4),
-            in_position,
-        ], value_input_option='RAW')
+        with open(signals_path, 'a', newline='') as f:
+            csv.writer(f).writerow([
+                today,
+                symbol,
+                round(close_px, 6),
+                round(signal.get('ensemble_prob', 0), 4),
+                round(signal.get('rf_prob', 0), 4),
+                round(signal.get('xgb_prob', 0), 4),
+                signal_fired,
+                reject_reason,
+                round(ofi_val, 4),
+                'YES' if ofi_val > OFI_GATE else 'NO',
+                round(float(features_row.get('rsi', 0)), 2),
+                round(float(features_row.get('atr_pct', 0)) * 100, 4),
+                in_position,
+            ])
     except Exception as e:
         logger.error(f'Log signal failed: {e}')
 
 
-def log_entry(trades_ws, signals_ws, today: str, symbol: str,
+def log_entry(trades_path, signals_path, today: str, symbol: str,
               entry_price: float, signal: dict,
               ofi_val: float, balance: float,
               features_row: pd.Series, trade_size: float,
               stop_order_id: str = '', fill_qty: float | str = '') -> str:
-    """Log new trade entry to DailyTrades. Returns row_id for later exit update."""
-    row_id = _next_row_id(trades_ws) if trades_ws else 'T0000'
+    """Log new trade entry to DailyTrades.csv. Returns row_id for later exit update."""
+    row_id = _next_row_id(trades_path) if trades_path else 'T0000'
 
-    if trades_ws:
+    if trades_path:
         try:
-            trades_ws.append_row([
-                row_id, today, symbol, 'OPEN',
-                round(entry_price, 6), '',
-                '', '', '', '',
-                '', '', round(balance, 2),
-                round(signal['ensemble_prob'], 4),
-                round(signal['rf_prob'], 4),
-                round(signal['xgb_prob'], 4),
-                round(trade_size, 4),             # col Q — used by log_exit
-                stop_order_id,                    # col R — resting stop order id, live-mode only
-                round(fill_qty, 8) if fill_qty != '' else '',  # col S — actual filled base-asset qty, live-mode only
-            ], value_input_option='RAW')
+            with open(trades_path, 'a', newline='') as f:
+                csv.writer(f).writerow([
+                    row_id, today, symbol, 'OPEN',
+                    round(entry_price, 6), '',
+                    '', '', '', '',
+                    '', '', round(balance, 2),
+                    round(signal['ensemble_prob'], 4),
+                    round(signal['rf_prob'], 4),
+                    round(signal['xgb_prob'], 4),
+                    round(trade_size, 4),             # col Q — used by log_exit
+                    stop_order_id,                    # col R — resting stop order id, live-mode only
+                    round(fill_qty, 8) if fill_qty != '' else '',  # col S — actual filled base-asset qty, live-mode only
+                ])
         except Exception as e:
             logger.error(f'Log entry failed: {e}')
 
     # Signal log: fired = True, no reject reason
-    log_signal(signals_ws, today, symbol, entry_price, signal,
+    log_signal(signals_path, today, symbol, entry_price, signal,
                ofi_val, features_row,
                signal_fired=True, reject_reason='NONE',
                in_position=False)
 
     return row_id
 
-def log_exit(trades_ws, pos: dict, balance: float) -> float:
+def log_exit(trades_path, pos: dict, balance: float) -> float:
     """
     Log trade exit. Returns updated balance.
     Uses trade_size stored at entry (col Q) so PnL is calculated on the
@@ -978,11 +942,14 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                 f'gross=${pnl_gross:+.2f} fee=${fees:.2f} '
                 f'net=${pnl_net:+.2f} bal=${new_bal:.2f}')
 
-    if trades_ws:
+    if trades_path:
         try:
-            rows    = trades_ws.get_all_values()
-            row_id  = str(pos.get('row_id', ''))
+            with open(trades_path, newline='') as f:
+                rows = list(csv.reader(f))
+            row_id = str(pos.get('row_id', ''))
             for i, row in enumerate(rows):
+                if i == 0:
+                    continue  # header
                 # Match by row_id (col A) if available, else fall back to
                 # date+symbol+OPEN+empty exit (original method)
                 match = (row_id and row and row[0] == row_id) or (
@@ -993,7 +960,7 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                     and not row[5]
                 )
                 if match:
-                    trades_ws.update(range_name=f'A{i+1}:S{i+1}', values=[[
+                    rows[i] = [
                         row[0],                               # row_id preserved
                         pos['date'], pos['symbol'], 'CLOSED',
                         round(float(pos['entry_price']), 6),
@@ -1013,8 +980,10 @@ def log_exit(trades_ws, pos: dict, balance: float) -> float:
                         # col S: fill_qty cleared — position is fully closed,
                         # nothing left to reference the base-asset qty for.
                         '',
-                    ]])
+                    ]
                     break
+            with open(trades_path, 'w', newline='') as f:
+                csv.writer(f).writerows(rows)
         except Exception as e:
             logger.error(f'Log exit failed: {e}')
 
@@ -1197,13 +1166,13 @@ def run():
     logger.info('=' * 60)
 
     # ── Connect ───────────────────────────────────────────────
-    _, trades_ws, signals_ws, meta_ws = init_sheets()
+    trades_path, signals_path, meta_path = init_store()
 
-    # FIX BUG 1: load balance from Sheets
-    balance = load_balance(meta_ws)
+    # FIX BUG 1: load balance from persistent store
+    balance = load_balance(meta_path)
     logger.info(f'Balance loaded: ${balance:.2f}')
 
-    peak_balance, halted = load_kill_switch_state(meta_ws)
+    peak_balance, halted = load_kill_switch_state(meta_path)
     if halted:
         logger.warning(f'  KILL SWITCH ACTIVE — new entries blocked '
                         f'(balance=${balance:.2f} peak=${peak_balance:.2f}). '
@@ -1216,7 +1185,7 @@ def run():
     })
 
     # ── Load open positions ────────────────────────────────────
-    open_positions = load_open_positions(trades_ws)
+    open_positions = load_open_positions(trades_path)
 
     # ── Fetch market data ─────────────────────────────────────
     logger.info('\nFetching market data...')
@@ -1243,7 +1212,7 @@ def run():
     logger.info('\nChecking exits...')
 
     # Live mode: ask the exchange whether any resting stop filled
-    # overnight BEFORE running check_exits()'s Sheet+OHLCV-only logic —
+    # overnight BEFORE running check_exits()'s store+OHLCV-only logic —
     # otherwise a position the exchange already sold would get
     # re-evaluated as still open. See reconcile_stop_fills() docstring.
     reconciled_exits = []
@@ -1252,12 +1221,12 @@ def run():
         positions_to_check, reconciled_exits = reconcile_stop_fills(
             exchange, open_positions, today)
         for pos in reconciled_exits:
-            balance = log_exit(trades_ws, pos, balance)
+            balance = log_exit(trades_path, pos, balance)
 
     to_close = check_exits(positions_to_check, ohlcv_data, today)
     for pos in to_close:
         if PAPER_MODE:
-            balance = log_exit(trades_ws, pos, balance)
+            balance = log_exit(trades_path, pos, balance)
             continue
 
         # Live mode: this is a poll-driven exit (TP/trailing/max-hold),
@@ -1275,7 +1244,7 @@ def run():
             pos = {**pos, 'exit_price': fill_px,
                   'pnl_pct': (fill_px - float(pos['entry_price'])) / float(pos['entry_price']),
                   'reason': 'SL'}
-            balance = log_exit(trades_ws, pos, balance)
+            balance = log_exit(trades_path, pos, balance)
         elif cancel_result['cancelled']:
             fill_qty = float(pos.get('fill_qty', 0) or 0)
             if fill_qty <= 0:
@@ -1286,7 +1255,7 @@ def run():
             if sold:
                 pos = {**pos, 'exit_price': sold['fill_price'],
                       'pnl_pct': (sold['fill_price'] - float(pos['entry_price'])) / float(pos['entry_price'])}
-                balance = log_exit(trades_ws, pos, balance)
+                balance = log_exit(trades_path, pos, balance)
             else:
                 logger.error(f'  {pos["symbol"]}: sell failed after stop '
                             f'cancel — position may be open and '
@@ -1301,7 +1270,7 @@ def run():
                         f'skipping this exit, will retry next run')
 
     # FIX BUG 1: persist updated balance after exits
-    save_balance(meta_ws, balance)
+    save_balance(meta_path, balance)
 
     # ── Kill switch: re-evaluate drawdown against the updated balance ──
     # Checked here (post-exit, pre-entry) so a today's-exits loss can
@@ -1313,7 +1282,7 @@ def run():
                      f'{KILL_SWITCH_DRAWDOWN*100:.0f}% threshold '
                      f'(balance=${balance:.2f} peak=${peak_balance:.2f}). '
                      f'New entries halted until manually reset.')
-    save_kill_switch_state(meta_ws, peak_balance, halted)
+    save_kill_switch_state(meta_path, peak_balance, halted)
 
     # ── Generate ML signals ───────────────────────────────────
     logger.info('\nGenerating signals...')
@@ -1353,7 +1322,7 @@ def run():
         if halted:
             reject = 'KILL_SWITCH_HALTED'
             logger.info(f'  {sym}: kill switch active — new entries blocked')
-            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+            log_signal(signals_path, today, sym, close_px, sig, ofi_val,
                        feats_row, signal_fired=False, reject_reason=reject,
                        in_position=in_pos_now)
             continue
@@ -1361,7 +1330,7 @@ def run():
         if n_open >= MAX_POSITIONS:
             reject = 'MAX_POSITIONS'
             logger.info(f'  {sym}: max positions ({n_open}/{MAX_POSITIONS})')
-            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+            log_signal(signals_path, today, sym, close_px, sig, ofi_val,
                        feats_row, signal_fired=False, reject_reason=reject,
                        in_position=in_pos_now)
             break
@@ -1369,7 +1338,7 @@ def run():
         if in_pos_now:
             reject = 'ALREADY_IN_POS'
             logger.info(f'  {sym}: already open — skip')
-            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+            log_signal(signals_path, today, sym, close_px, sig, ofi_val,
                        feats_row, signal_fired=False, reject_reason=reject,
                        in_position=True)
             continue
@@ -1380,7 +1349,7 @@ def run():
         if not ml_sig:
             reject = f'PROB_TOO_LOW_{prob:.4f}'
             logger.info(f'  {sym}: ML no signal (prob={prob:.3f})')
-            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+            log_signal(signals_path, today, sym, close_px, sig, ofi_val,
                        feats_row, signal_fired=False, reject_reason=reject,
                        in_position=False)
             continue
@@ -1388,7 +1357,7 @@ def run():
         if not ofi_ok:
             reject = f'OFI_NEGATIVE_{ofi_val:+.4f}'
             logger.info(f'  {sym}: ML signal but OFI={ofi_val:+.4f} blocked by gate')
-            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+            log_signal(signals_path, today, sym, close_px, sig, ofi_val,
                        feats_row, signal_fired=False, reject_reason=reject,
                        in_position=False)
             continue
@@ -1400,7 +1369,7 @@ def run():
         # FIX MINOR: minimum order check
         if trade_size < MIN_ORDER_USDT:
             logger.warning(f'  {sym}: trade_size=${trade_size:.2f} < min ${MIN_ORDER_USDT}')
-            log_signal(signals_ws, today, sym, close_px, sig, ofi_val,
+            log_signal(signals_path, today, sym, close_px, sig, ofi_val,
                        feats_row, signal_fired=False,
                        reject_reason='MIN_ORDER_SIZE',
                        in_position=False)
@@ -1428,7 +1397,7 @@ def run():
                     # stop — flatten immediately rather than hope tomorrow's
                     # run catches an unprotected crash. See PROGRESS.md
                     # session 9. A real buy already executed, so either
-                    # outcome below still needs a real Sheet record — this
+                    # outcome below still needs a real trade-log record — this
                     # is a real (if unwanted) round-trip trade, not a no-op.
                     logger.error(f'  {sym}: stop-loss placement failed — '
                                 f'flattening position immediately (fail-safe)')
@@ -1439,10 +1408,10 @@ def run():
                         logger.error(f'  {sym}: flattened @ {exit_px:.4f} '
                                     f'(pnl={pnl_pct*100:+.2f}%) — SL placement '
                                     f'failure, not a strategy exit')
-                        row_id = log_entry(trades_ws, signals_ws, today, sym,
+                        row_id = log_entry(trades_path, signals_path, today, sym,
                                            entry_px, sig, ofi_val, balance,
                                            feats_row, trade_size, '', fill_qty)
-                        balance = log_exit(trades_ws, {
+                        balance = log_exit(trades_path, {
                             'row_id': row_id, 'symbol': sym, 'date': today,
                             'entry_price': entry_px, 'exit_price': exit_px,
                             'pnl_pct': pnl_pct, 'hold_days': 0,
@@ -1457,7 +1426,7 @@ def run():
                         # in load_open_positions() next run rather than being
                         # silently lost — better a visibly-broken row than no
                         # record of real capital sitting on the exchange.
-                        log_entry(trades_ws, signals_ws, today, sym,
+                        log_entry(trades_path, signals_path, today, sym,
                                  entry_px, sig, ofi_val, balance, feats_row,
                                  trade_size, 'FLATTEN_FAILED', fill_qty)
                         n_open += 1
@@ -1467,7 +1436,7 @@ def run():
                                      # normal log_entry below either way
 
         if filled:
-            log_entry(trades_ws, signals_ws, today, sym,
+            log_entry(trades_path, signals_path, today, sym,
                       entry_px, sig, ofi_val, balance, feats_row, trade_size,
                       stop_order_id, fill_qty if not PAPER_MODE else '')
             n_open += 1
