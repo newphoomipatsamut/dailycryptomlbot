@@ -1,0 +1,1 @@
+row_id,date,symbol,action,entry_price,exit_price,pnl_gross,pnl_net,fees,reason,hold_days,win,balance_after,signal_prob,rf_prob,xgb_prob,trade_size,stop_order_id,fill_qty
