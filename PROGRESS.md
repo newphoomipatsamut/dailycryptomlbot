@@ -5,6 +5,140 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-14 (session 12) — Ran the never-before-run exact backtest, found and fixed a real concurrent-position sizing bug, ran an 8yr bull/bear regime check. VERDICT: strategy paused — user taking a break from this project.
+
+**Why this session happened:** user asked "how do we backtest it properly
+to be trusted" — the honest answer was that no one had ever actually run
+`FAST_MODE=False` (the exact live-equivalent: 200 estimators, daily
+retrain) since the session-8 winsorize/regularization fix and the
+session-10 sizing change both landed. Every number quoted in this repo
+until today was either stale or from the fast/approximate mode.
+
+**Step 1 — fixed a real bug found while trying to run `FAST_MODE=False`:**
+`FAST_MODE` was a hardcoded Python constant (`FAST_MODE = True`), not an
+env var, despite the module's own docstring implying `FAST_MODE=False
+python backtest.py` was valid usage. Every such invocation in this repo's
+history silently no-op'd and ran fast mode anyway. Fixed to read from
+`os.environ` like `DATA_SOURCE`/`OFI_GATE_ENABLED` already do; verified
+the fix actually changes `N_EST`/`RETRAIN_EVERY` before trusting a long
+run on it.
+
+**Step 2 — ran the real thing (`FAST_MODE=False DATA_SOURCE=kraken`,
+~28 min):** CAGR 0.7%, Sharpe 2.45, Calmar 7.19, max drawdown -0.1%, win
+rate 39.1%, profit factor 1.81, 335 trades, all 3 symbols individually net
+positive. This superseded the stale session-4 table (14.5-25% CAGR),
+which was quoted for months without anyone flagging it was computed under
+the old 25% `RISK_PER_TRADE` before the fee/lookahead fixes even existed —
+compounding at 25% risk amplifies bookkeeping noise into huge, meaningless
+swings. Win rate/PF are the sizing-independent numbers and were roughly
+consistent with the old table, so trade *quality* wasn't the fiction —
+only the dollar CAGR was.
+
+**Step 3 — user pushed back: "no one wants to see $10,000 become $10,070
+in a year, wouldn't raising position size help?"** Fair question, answered
+with real numbers instead of a reflexive "stay conservative": replayed
+the actual 335-trade sequence at multiple `RISK_PER_TRADE` values. Found
+raising sizing to 5-10% *would* produce a CAGR worth someone's time
+(4-9%) while keeping realized drawdown under ~1.1% in this specific
+backtest window — but also found and flagged **a real correctness bug**
+while doing this analysis: `trade_size = balance * RISK_PER_TRADE` was
+computed independently per position with `MAX_POSITIONS=3` allowed
+concurrently open, and NOT divided across them. In this exact trade
+history, 3 positions were open simultaneously 9 separate times — meaning
+`RISK_PER_TRADE=25%` (the old default) could have put up to 75-108% of
+the account at risk at once, silently, never surfaced anywhere in logs or
+metrics.
+
+**Step 4 — user asked for a genuinely fair comparison before deciding
+anything: does the strategy actually beat buy-and-hold?** Fetched real
+ETH/SOL/LINK closes for the exact backtest window (2024-07-24 to
+2026-07-14) directly from Kraken. All three fell 41-58% over this window
+(a crypto bear market). Equal-weight buy-and-hold: $10,000 -> $5,163
+(-48.4%). Strategy: $10,000 -> $10,147 (+1.5%). **+49.8 percentage points
+of outperformance** — but flagged honestly rather than declared a win:
+the strategy is only in a position ~19% of the time (avg hold 1.1 days),
+so a large share of that outperformance is just *not being exposed*
+during a crash, not necessarily proof of skillful entry selection. Trade-
+level stats (39% win rate, PF 1.81, all 3 symbols individually positive)
+suggest real selectivity exists, but this backtest alone (one 2yr bear
+window) can't fully separate "smart entries" from "mostly avoided a
+crash." Reframed the goal from "maximize CAGR" to "this may be a capital-
+preservation tool, not a high-return one" — user's response: goal is
+explicitly meaningful absolute returns, not preservation, so that framing
+doesn't fit what they actually want.
+
+**Step 5 — fixed the concurrent-position sizing bug for real** (not just
+flagged it): `trade_size = balance * RISK_PER_TRADE / MAX_POSITIONS` in
+both `crypto_daily_ml_v3.py` (the live/paper entry logic AND the
+`log_exit()` legacy-row fallback) and `backtest.py` (kept in sync per
+established repo convention). Now `RISK_PER_TRADE` genuinely bounds
+TOTAL simultaneous exposure across all open positions — worst case (all
+`MAX_POSITIONS` slots filled) is exactly `RISK_PER_TRADE` of the account,
+not up to `MAX_POSITIONS x RISK_PER_TRADE`. Verified the arithmetic
+directly (`1% risk / 3 positions -> $33.33/position -> $100 total worst
+case on $10k = exactly 1%`) before trusting it in a long backtest run.
+**This is a real correctness fix independent of any sizing decision** —
+worth keeping even though the project is now paused.
+
+**Step 6 — the regime question, which turned out to be decisive.** Before
+committing to any sizing number, ran an 8-year Binance backtest
+(2018-2026, `FAST_MODE=True` for turnaround time — spans the 2018 crash,
+2020-21 bull run, 2022 crash, 2023-25 recovery) to check whether the
+strategy's Kraken-window performance was a bear-market artifact or a real
+edge. **Result: CAGR 0.4%, total return 3.0% over 8 years (Sharpe 3.84,
+Calmar 6.57, win rate 47.5%, PF 2.67, 1207 trades)** — essentially flat
+across a FULL bull cycle where ETH went ~$100 to ~$4,800 at the 2021
+peak. This is the finding that changed the recommendation: the strategy
+is NOT "does great in a crash, does even better in a bull run" — it's
+flat-to-barely-positive in BOTH regimes. Trade-level quality is real
+(win rate, PF both solid, all symbols individually positive across 8yrs)
+but the edge appears structurally thin per-trade (avg win $0.84 vs avg
+loss -$0.28 at 1% sizing, ~1 day avg hold) and does not compound into
+real absolute returns even across a historic bull run. Given the user's
+stated goal (meaningful absolute returns, not capital preservation),
+**raising position size will scale the dollar drawdown risk right
+alongside the return** without fixing the actual constraint, which is
+that the edge is small on a percentage basis, not that sizing was too
+conservative.
+
+**Verdict / decision: user is pausing this project ("take a break from
+our crypto bot for now").** Not abandoned, not declared a failure outright
+— explicitly a pause. If picked back up:
+- The sizing bug fix (`RISK_PER_TRADE / MAX_POSITIONS`) should stay
+  regardless of any future strategy decision — it's a correctness fix,
+  not a strategy choice.
+- The open question that would need answering before any real-capital
+  decision is still open: is there a variant of this strategy (different
+  features, longer hold times, different threshold) that produces a
+  LARGER edge per trade, since sizing alone can't manufacture edge that
+  isn't there. Nothing here ruled that out — it ruled out "just raise
+  RISK_PER_TRADE on the current strategy" as a path to meaningful
+  absolute returns.
+- `Restart=always` daily cron (GH Actions, `daily_ml.yml`) is still live
+  and will keep running in `PAPER_MODE=true` unless explicitly disabled —
+  the pause is about NOT actively developing this further, not about
+  stopping the paper-trading data collection. Worth explicitly confirming
+  with the user whether they want the cron disabled too, or left running
+  so evidence keeps accumulating passively during the break.
+- Model is still dormant (SIGNAL_THRESHOLD=0.60 unmet since 2026-05-04
+  per session 7-8's finding) — expected to self-resolve ~Aug/Dec 2026 as
+  outlier days roll out of the rolling training window. No action needed,
+  just don't be surprised if it's still quiet next time this is revisited.
+- Fresh Kraken exact-mode run WITH the sizing fix applied
+  (`backtest_trades_kraken.csv`/`backtest_equity_kraken.csv`, launched
+  this session) was still in progress when this entry was written —
+  results not yet in this log. Check `/tmp/backtest_fixed_kraken.log` if
+  it's still on disk, or just re-run
+  `FAST_MODE=False DATA_SOURCE=kraken python backtest.py` (~28min) fresh
+  when this project is picked back up, since the underlying data will
+  have moved on by then anyway.
+
+Code: `crypto_daily_ml_v3.py`, `backtest.py` (both: `FAST_MODE` env-var
+fix, `RISK_PER_TRADE / MAX_POSITIONS` sizing fix). Not yet committed as
+of this entry — do so together with this doc update.
+
+---
+
 ## 2026-07-14 (session 11) — Replaced Google Sheets with git-committed CSV/JSON
 
 User asked which was better for their workflow, Sheets or CSV — recommended

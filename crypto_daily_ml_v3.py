@@ -132,14 +132,24 @@ SYMBOLS          = ['ETH/USDT', 'SOL/USDT', 'LINK/USDT']
 
 PAPER_MODE       = os.environ.get('PAPER_MODE', 'true').lower() == 'true'
 STARTING_BALANCE = float(os.environ.get('PAPER_BALANCE', 10000.0))
-RISK_PER_TRADE   = 0.01          # lowered from 0.25 for real-capital readiness
-                                 # (session 10) — 25% was a backtest-sizing
-                                 # choice never meant for live capital: n=10
-                                 # live trades is too thin to trust, and the
-                                 # session-9 stop-loss/exit-execution code is
-                                 # still unexercised against a real order.
-                                 # Revisit upward only once both have more
-                                 # runway. See PROGRESS.md session 10.
+RISK_PER_TRADE   = 0.01          # TOTAL portfolio risk budget, divided across
+                                 # up to MAX_POSITIONS concurrently open
+                                 # positions (see the trade_size line in run()
+                                 # below) -- fixed a real bug where this was
+                                 # applied per-position with no division, so
+                                 # up to MAX_POSITIONS x this fraction of the
+                                 # account could be at risk simultaneously.
+                                 # Lowered from 0.25 for real-capital
+                                 # readiness (session 10) — 25% was a
+                                 # backtest-sizing choice never meant for live
+                                 # capital: n=10 live trades is too thin to
+                                 # trust, and the session-9 stop-loss/exit-
+                                 # execution code is still unexercised
+                                 # against a real order. Revisit upward only
+                                 # once both have more runway, and only after
+                                 # validating the mechanism with
+                                 # validate_stop_loss.py first. See
+                                 # PROGRESS.md sessions 10, 12.
 TAKE_PROFIT_PCT  = 0.030
 STOP_LOSS_PCT    = 0.010
 MAX_HOLD_DAYS    = 5
@@ -931,7 +941,7 @@ def log_exit(trades_path, pos: dict, balance: float) -> float:
     actual allocated amount, not the current balance.
     """
     stored = pos.get('trade_size', '')
-    trade_size = float(stored) if stored else balance * RISK_PER_TRADE
+    trade_size = float(stored) if stored else balance * RISK_PER_TRADE / MAX_POSITIONS
     pnl_gross  = pos['pnl_pct'] * trade_size
     fees       = trade_size * TAKER_FEE * 2
     pnl_net    = pnl_gross - fees
@@ -1364,7 +1374,17 @@ def run():
 
         # Both ML signal AND positive OFI — enter
         entry_px   = close_px
-        trade_size = balance * RISK_PER_TRADE
+        # Divide by MAX_POSITIONS so RISK_PER_TRADE bounds TOTAL exposure
+        # across all concurrently open positions, not per-position exposure.
+        # Before this fix, 3 positions open at once (RISK_PER_TRADE each,
+        # sized independently against balance) could put up to
+        # 3xRISK_PER_TRADE of the account at risk simultaneously -- e.g.
+        # RISK_PER_TRADE=0.25 meant up to 75-100%+ of capital exposed at
+        # once, not 25%, silently. Doesn't resize already-open positions
+        # (no live rebalancing -- would mean selling/rebuying and adding
+        # fees for no real benefit), so the guarantee holds even in the
+        # worst case where all MAX_POSITIONS slots are filled.
+        trade_size = balance * RISK_PER_TRADE / MAX_POSITIONS
 
         # FIX MINOR: minimum order check
         if trade_size < MIN_ORDER_USDT:

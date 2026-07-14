@@ -40,6 +40,7 @@ Usage:
     pip install ccxt pandas numpy scikit-learn xgboost
     python backtest.py
     DATA_SOURCE=kraken OFI_GATE_ENABLED=true python backtest.py
+    FAST_MODE=false DATA_SOURCE=kraken python backtest.py   # exact live-equivalent
 """
 
 import json, logging, os, time, urllib.request
@@ -66,12 +67,15 @@ logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 SYMBOLS           = ['ETH/USDT', 'SOL/USDT', 'LINK/USDT']
-RISK_PER_TRADE    = 0.01   # matches live (lowered from 0.25 in session 10 —
-                           # see crypto_daily_ml_v3.py for rationale). NOTE:
-                           # CAGR/Sharpe/drawdown are NOT comparable to any
-                           # backtest run before this change — they scale
-                           # with position size. Win rate/PF/trade count are
-                           # still comparable (sizing-independent).
+RISK_PER_TRADE    = 0.01   # TOTAL portfolio risk budget, divided across up to
+                           # MAX_POSITIONS concurrently open positions (see
+                           # session 12 fix below) -- matches live (lowered
+                           # from 0.25 in session 10, see crypto_daily_ml_v3.py
+                           # for rationale). NOTE: CAGR/Sharpe/drawdown are NOT
+                           # comparable to any backtest run before EITHER of
+                           # these two changes — they scale with position
+                           # size. Win rate/PF/trade count are still
+                           # comparable (sizing-independent).
 TAKE_PROFIT_PCT   = 0.030
 STOP_LOSS_PCT     = 0.010
 MAX_HOLD_DAYS     = 5
@@ -95,7 +99,12 @@ CANDLE_LIMIT      = YEARS * 366 + 30   # small buffer
 TRAIN_WINDOW      = 180
 MIN_WARMUP_DAYS   = 80
 
-FAST_MODE         = True   # False → exact live-equivalent (slower)
+FAST_MODE         = os.environ.get('FAST_MODE', 'true').lower() == 'true'
+                           # False → exact live-equivalent (slower). Was a
+                           # hardcoded constant until 2026-07-14 — every
+                           # prior "FAST_MODE=False python backtest.py"
+                           # invocation in this repo's own docs/PROGRESS.md
+                           # silently no-op'd and ran FAST_MODE=True instead.
 N_EST             = 50  if FAST_MODE else 200
 RETRAIN_EVERY     = 5   if FAST_MODE else 1   # days between model retrains
 
@@ -604,7 +613,13 @@ def run_backtest():
                 ofi_today = ofi_series.get(sym, pd.Series()).get(today_dt, 0.0)
                 if ofi_today <= OFI_GATE:
                     continue
-            trade_size = balance * RISK_PER_TRADE
+            # Divide by MAX_POSITIONS so RISK_PER_TRADE bounds TOTAL exposure
+            # across all concurrently open positions -- matches the same fix
+            # in crypto_daily_ml_v3.py (kept in sync per repo convention).
+            # Before this fix, RISK_PER_TRADE was applied per-position with
+            # no division, so up to MAX_POSITIONS x RISK_PER_TRADE of the
+            # account could be at risk simultaneously, silently.
+            trade_size = balance * RISK_PER_TRADE / MAX_POSITIONS
             if trade_size < 15:
                 continue
             # Live's check_exits() scans entry_date..yesterday (inclusive of the
