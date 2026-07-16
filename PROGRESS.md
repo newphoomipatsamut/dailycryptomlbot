@@ -31,8 +31,75 @@ tuning.
 Asked the user what "continue" means given the pause — options are: (a)
 resume the open "find a variant with a larger per-trade edge" R&D question
 from session 12, (b) just keep monitoring/health-checking passively, or (c)
-something else. Waiting on that before doing any strategy work, per the
-standing don't-tune-without-asking rule.
+something else. **User chose (a): resume the edge-search.**
+
+**Continued, same session — found and fixed a real TRAIL_BE bug, ~3x'd
+CAGR (still small in absolute terms).** Analyzed `backtest_trades_kraken.csv`
+from the session-12 fixed-sizing run before proposing any new tuning: all
+131 `TRAIL_BE` exits had `pnl_gross` EXACTLY 0.0 — the "trailing stop to
+breakeven" mechanism (`effective_sl = entry_px` once armed) doesn't lock in
+any of the gain that armed it, so every single TRAIL_BE exit was a
+guaranteed fee-only loss (-$22.78 across 131 trades in that run), not the
+"protects profit" behavior the code comment claimed. This is the same
+"39% of all trades hitting one mechanism" scale as TP itself (131 TP / 131
+TRAIL_BE / 73 SL) — a real lever, not a rounding error.
+
+Screened several fixes in `FAST_MODE` on Kraken 2yr data before trusting
+any of them (baseline refreshed fresh this session: CAGR 0.1%/PF 1.56/212
+trades — TRAIL_BE alone net -$16.32):
+- Fee-covering buffer (`entry_px * 1.006`): CAGR 0.2%→ish, TRAIL_BE flips
+  to +$2.33. Works but leaves value on the table.
+- Raising `BREAKEVEN_TRIGGER` 1.5%→2.5% (require more room before arming):
+  made it WORSE (CAGR back down, more trades fall into hard SL instead).
+  Not pursued further.
+- **Lock the trigger gain itself** (`effective_sl = entry_px * (1 +
+  BREAKEVEN_TRIGGER)` instead of flat `entry_px`) — i.e. the stop protects
+  exactly the 1.5% that armed it, no new magic number, reuses the existing
+  constant: CAGR 0.1%→0.3%, PF 1.56→4.47, Sharpe 2.95→4.63, TRAIL_BE
+  flips to +$28.52. Best of the variants tried.
+- `SIGNAL_THRESHOLD` 0.60→0.65 (on top of the fix): WORSE (CAGR down, same
+  "cuts volume not quality" pattern seen before in this project with the
+  OFI gate and XGB regularization) — not adopted.
+
+Confirmed the trigger-gain-lock fix on both held-out checks before
+applying it live:
+- **Exact-mode Kraken** (200 est., daily retrain, apples-to-apples with
+  session 12's own pre-fix number): CAGR 0.2%→**0.6%**, Sharpe 2.45→**5.82**,
+  PF 1.81→**4.12**, TRAIL_BE -$22.78→**+$44.71** (136 trades).
+- **8yr Binance bull/bear cross-check** (2018 crash/2020-21 bull/2022
+  crash/2023-25 recovery, same check as session 12's regime test): CAGR
+  0.4%→**0.6%**, total return 3.0%→**5.0%**, PF 2.67→**5.56**, Sharpe
+  3.84→**6.38**, TRAIL_BE flips to +$139.00 (414 trades) — holds up
+  out-of-sample, not an artifact of the 2yr window.
+
+Applied the fix to both `check_exits()` (crypto_daily_ml_v3.py) and
+`check_exit()` (backtest.py), kept in sync per repo convention:
+`effective_sl` when trailing is now `entry_px * (1 + BREAKEVEN_TRIGGER)`
+instead of flat `entry_px`; `TRAIL_BE` exit now records `pnl_pct =
+BREAKEVEN_TRIGGER` instead of `0.0`. No new tunable constant introduced —
+reuses `BREAKEVEN_TRIGGER`, which already existed. Verified: `py_compile`
+clean on both files; a synthetic `check_exits()` unit test (position arms
+breakeven day 1, price reverts day 3) confirms TRAIL_BE now exits at
++1.50% instead of $0.00; separate synthetic checks confirm plain SL and TP
+paths are unaffected; re-ran `FAST_MODE=true DATA_SOURCE=kraken
+python backtest.py` with the cleaned-up (no-env-var) code and got the
+identical result (CAGR 0.3%/PF 4.47/Sharpe 4.63) as the env-var-driven
+experiment, confirming the cleanup didn't change behavior.
+
+**Honest framing, not declared a win:** this is a real, cross-validated
+correctness fix (the old code's own comment said it "protects profits"
+but it never actually captured any) — worth keeping regardless of any
+other strategy decision, same category as session 12's concurrent-sizing
+bug. It roughly **triples** CAGR (0.2%→0.6% exact-mode Kraken), but from a
+tiny base — still nowhere near "meaningful absolute returns" per the
+user's stated goal. Session 12's core finding stands: the underlying
+per-trade edge is structurally thin (avg win ~$0.58 vs avg loss ~$0.51 at
+1% sizing); this fix recovers value the strategy was already earning but
+throwing away via faulty stop logic — it doesn't manufacture a bigger
+edge from nothing. If the user wants a genuinely larger edge, the open
+question from session 12 is still open: try different features / longer
+holds / a different threshold regime, not just recover bugs in exit
+mechanics.
 
 ---
 

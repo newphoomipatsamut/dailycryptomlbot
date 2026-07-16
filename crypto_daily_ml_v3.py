@@ -157,8 +157,10 @@ MAX_POSITIONS    = 3             # one per symbol (raised from 2)
 SIGNAL_THRESHOLD = 0.60          # ensemble P(up) threshold
 OFI_GATE         = 0.0           # OFI snapshot must be > this to allow entry
                                  # (positive = buy pressure in order book)
-BREAKEVEN_TRIGGER= 0.015         # once position up 1.5%, SL moves to breakeven
-                                 # protects profits without widening initial SL
+BREAKEVEN_TRIGGER= 0.015         # once position up 1.5%, SL moves to lock in
+                                 # that 1.5% (not flat entry — see session 13,
+                                 # PROGRESS.md — flat breakeven was a
+                                 # guaranteed fee-only loss every time)
 TAKER_FEE        = 0.0026        # v4 removed post-only (oflags:post), so entry
                                  # fills as taker, not maker — fee must match
 MIN_ORDER_USDT   = 15.0          # Kraken minimum order value
@@ -736,9 +738,17 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
     only changes how EXITS are evaluated, not entries.
 
     Trailing stop logic:
-      Once daily HIGH reaches entry × (1 + BREAKEVEN_TRIGGER),
-      the effective SL is raised to entry price (breakeven).
-      Converts "almost won, gave it back" trades into zero-cost exits.
+      Once daily HIGH reaches entry × (1 + BREAKEVEN_TRIGGER), the
+      effective SL is raised to entry × (1 + BREAKEVEN_TRIGGER) — i.e. it
+      locks in the gain that armed it, not flat entry price. (Session 13
+      edge-search fix: the old flat-breakeven version exited every
+      TRAIL_BE trade at exactly $0.00 gross, making it a guaranteed
+      fee-only loss 100% of the time — verified against the session-12
+      backtest log where all 131 TRAIL_BE trades had pnl_gross exactly
+      0.0. Locking the trigger gain instead turned TRAIL_BE from a
+      reliable -$22.78 drag into a reliable +$44.71 contributor on the
+      same 2yr Kraken data, and held up on an 8yr Binance bull/bear
+      cross-check too — see PROGRESS.md session 13.)
       Checked in order: TP first, then trailing SL, then fixed SL.
     """
     to_close = []
@@ -798,7 +808,7 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
         except Exception:
             pass
 
-        effective_sl = entry_px if trailing_active else sl_price
+        effective_sl = be_trigger_px if trailing_active else sl_price
 
         # ── Exit logic ────────────────────────────────────────────────────
         tp_hit  = daily_high >= tp_price
@@ -814,9 +824,9 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
             exit_pnl   = TAKE_PROFIT_PCT
         elif sl_hit:
             if trailing_active:
-                reason     = 'TRAIL_BE'          # trailing stop at breakeven
-                exit_price = entry_px             # exits at entry = $0 gross
-                exit_pnl   = 0.0
+                reason     = 'TRAIL_BE'          # trailing stop, locks in the trigger gain
+                exit_price = be_trigger_px
+                exit_pnl   = BREAKEVEN_TRIGGER
             else:
                 reason     = 'SL'
                 exit_price = sl_price

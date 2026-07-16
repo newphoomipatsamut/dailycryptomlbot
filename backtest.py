@@ -80,8 +80,10 @@ TAKE_PROFIT_PCT   = 0.030
 STOP_LOSS_PCT     = 0.010
 MAX_HOLD_DAYS     = 5
 MAX_POSITIONS     = 3
-SIGNAL_THRESHOLD  = 0.60
-BREAKEVEN_TRIGGER = 0.015
+SIGNAL_THRESHOLD  = float(os.environ.get('SIGNAL_THRESHOLD', 0.60))  # env override kept for edge-search screening, see session 13
+BREAKEVEN_TRIGGER = 0.015  # once position up 1.5%, trailing SL locks in
+                           # that 1.5% (not flat entry price -- see
+                           # check_exit() below and PROGRESS.md session 13).
 TAKER_FEE         = 0.0026   # taker fill (post v4 fix)
 OFI_GATE          = 0.0      # matches live's OFI_GATE — proxy must be > this
 STARTING_BALANCE  = 10_000.0
@@ -422,7 +424,7 @@ def check_exit(pos: dict, today_dt: date_t, today_row: pd.Series) -> dict | None
     be_trigger_px = entry_px * (1 + BREAKEVEN_TRIGGER)
 
     trailing = pos.get('trailing_active', False)
-    effective_sl = entry_px if trailing else sl_price
+    effective_sl = be_trigger_px if trailing else sl_price
 
     tp_hit = daily_high >= tp_price
     sl_hit = daily_low  <= effective_sl
@@ -432,7 +434,7 @@ def check_exit(pos: dict, today_dt: date_t, today_row: pd.Series) -> dict | None
         result = {'reason': 'TP',     'exit_price': tp_price,  'pnl_pct':  TAKE_PROFIT_PCT}
     elif sl_hit:
         if trailing:
-            result = {'reason': 'TRAIL_BE', 'exit_price': entry_px, 'pnl_pct': 0.0}
+            result = {'reason': 'TRAIL_BE', 'exit_price': be_trigger_px, 'pnl_pct': BREAKEVEN_TRIGGER}
         else:
             result = {'reason': 'SL',       'exit_price': sl_price,  'pnl_pct': -STOP_LOSS_PCT}
     elif hold_days >= MAX_HOLD_DAYS:
