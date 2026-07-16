@@ -5,6 +5,37 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## 2026-07-17 (session 13) — Resumed after the pause: health check + closed out the one loose end from session 12.
+
+Pulled `origin/main` (2 new automated commits, `2026-07-15`/`2026-07-16` daily
+cron runs, local was behind). Health check: GitHub Actions still 100% green
+(last scheduled run `2026-07-16T03:26Z`, next due `2026-07-17T00:05Z` per
+cron), `PAPER_MODE` still true, balance still flat at exactly $10,000.00,
+model still dormant (every symbol's prob still `PROB_TOO_LOW_*`, well under
+the 0.60 threshold) — all consistent with the session 7-8 diagnosis, no
+surprises.
+
+Session 12 left one thing unresolved: a fresh `FAST_MODE=False
+DATA_SOURCE=kraken` backtest with the concurrent-position sizing fix
+applied was "still in progress" when that entry was written, log location
+noted as `/tmp/backtest_fixed_kraken.log`. That log was still on disk
+(finished the same evening, `2026-07-14 17:13`, nobody had read the result
+since). Result: **336 trades, 39.1% win rate, PF 1.81, total return 0.5%,
+CAGR 0.2%, Sharpe 2.45, max drawdown -0.0%** — consistent with the
+session-12 pre-fix number (CAGR 0.7%, same win rate/PF), confirming the
+sizing bug fix didn't change the underlying finding: trade quality is real
+but the edge is structurally thin in dollar terms at 1% risk/trade. No new
+decision made — this just closes the open item, doesn't reopen strategy
+tuning.
+
+Asked the user what "continue" means given the pause — options are: (a)
+resume the open "find a variant with a larger per-trade edge" R&D question
+from session 12, (b) just keep monitoring/health-checking passively, or (c)
+something else. Waiting on that before doing any strategy work, per the
+standing don't-tune-without-asking rule.
+
+---
+
 ## 2026-07-14 (session 12) — Ran the never-before-run exact backtest, found and fixed a real concurrent-position sizing bug, ran an 8yr bull/bear regime check. VERDICT: strategy paused — user taking a break from this project.
 
 **Why this session happened:** user asked "how do we backtest it properly
