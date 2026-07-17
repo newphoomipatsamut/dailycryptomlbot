@@ -86,20 +86,115 @@ python backtest.py` with the cleaned-up (no-env-var) code and got the
 identical result (CAGR 0.3%/PF 4.47/Sharpe 4.63) as the env-var-driven
 experiment, confirming the cleanup didn't change behavior.
 
-**Honest framing, not declared a win:** this is a real, cross-validated
-correctness fix (the old code's own comment said it "protects profits"
-but it never actually captured any) — worth keeping regardless of any
-other strategy decision, same category as session 12's concurrent-sizing
-bug. It roughly **triples** CAGR (0.2%→0.6% exact-mode Kraken), but from a
-tiny base — still nowhere near "meaningful absolute returns" per the
-user's stated goal. Session 12's core finding stands: the underlying
-per-trade edge is structurally thin (avg win ~$0.58 vs avg loss ~$0.51 at
-1% sizing); this fix recovers value the strategy was already earning but
-throwing away via faulty stop logic — it doesn't manufacture a bigger
-edge from nothing. If the user wants a genuinely larger edge, the open
-question from session 12 is still open: try different features / longer
-holds / a different threshold regime, not just recover bugs in exit
-mechanics.
+**Honest framing, not declared a win (SUPERSEDED BELOW — see correction):**
+this is a real, cross-validated correctness fix (the old code's own
+comment said it "protects profits" but it never actually captured any) —
+worth keeping regardless of any other strategy decision, same category as
+session 12's concurrent-sizing bug. It roughly **triples** CAGR (0.2%→0.6%
+exact-mode Kraken), but from a tiny base — still nowhere near "meaningful
+absolute returns" per the user's stated goal. Session 12's core finding
+stands: the underlying per-trade edge is structurally thin (avg win
+~$0.58 vs avg loss ~$0.51 at 1% sizing); this fix recovers value the
+strategy was already earning but throwing away via faulty stop logic — it
+doesn't manufacture a bigger edge from nothing. If the user wants a
+genuinely larger edge, the open question from session 12 is still open:
+try different features / longer holds / a different threshold regime, not
+just recover bugs in exit mechanics.
+
+---
+
+## CORRECTION (same session 13, same day) — the "3x CAGR" claim above WAS ITSELF A BACKTEST-ACCOUNTING ARTIFACT. Pushed commit `68cb905` overstated the fix; superseded by a second fix.
+
+**User's prompt: "Can you use some tests to validate that the edge is
+real? This looks too good."** Correct instinct — same shape as
+[[project_reaper_trading]]'s Reaper incident (a "9x-replicated, p<0.02
+everywhere" edge that turned out to be a look-ahead bug, per
+`feedback_statistical_rigor` lesson 5). Ran the equivalent playbook here.
+
+**Check 1 — Sharpe/Calmar methodology (lesson 4, the project's own repeat
+mistake): PASSED.** `equity.append()` runs every iteration of the
+walk-forward loop over `all_dates` (every calendar day in the OHLCV
+index), not just on trade-close days — confirmed empirically (721 equity
+rows over a 720-day span, 720 return observations, only 159 nonzero).
+Sharpe is correctly computed on a full-calendar zero-filled series, not
+the lesson-4 sparse-groupby bug. The high Sharpe (~5) is a legitimate
+consequence of tiny, highly quantized returns at 1% risk/trade, not a
+computation bug.
+
+**Check 2 — TRAIL_BE fill-realism audit: FAILED, and this is the real
+finding.** `trailing_active` only arms starting the day AFTER price first
+touches `be_trigger_px` (the arm day's own low is never checked against
+it — deliberate, mirrors "never exit same day as entry"). Pulled real
+OHLCV (Kraken + Binance) and checked each TRAIL_BE exit's day against its
+own OPEN price: **87/87 trades on the 2yr Kraken run, and 411/414 on the
+8yr Binance run, had that day's OPEN already below the assumed
+`be_trigger_px` fill level** — i.e. by the time the exit condition could
+even be confirmed (one full day after arming, given the architecture),
+price had already fallen back through the target almost every single
+time. Re-pricing BOTH the old (flat-entry) and new (trigger-lock) trail
+levels using a realistic cap (`fill = min(theoretical_level,
+that_day's_open)`) — applying the identical realism correction to both,
+per lesson 3's "the honest quantity is the delta, not the absolute" —
+collapsed the reported improvement:
+- 2yr Kraken: delta dropped from **+$43.65 (as reported) to +$1.83**
+  (bootstrap 95% CI [$0.010, $0.036]/trade — nonzero, but ~96% of the
+  claimed gain was fill-price fiction).
+- 8yr Binance: delta dropped from **+$212.75 (as reported) to +$4.64**
+  (~98% fiction).
+
+**Root cause, and why TP wasn't affected:** TP is checked against THAT
+SAME day's own high (no arm-then-confirm lag) — a resting limit-sell
+genuinely fills at/above the limit the moment it's touched, so TP's
+"exit exactly at target" assumption is the standard, valid backtest
+convention (confirmed: 0/67 TP trades had any gap-through-in-the-adverse-
+direction issue). Plain SL is also fine (0/37 gap-through cases — SL is
+checked directly against today's own low, no lag either). The bug is
+narrowly scoped to TRAIL_BE's two-step arm-day/confirm-day design, which
+neither the original flat-breakeven code nor my first "fix" accounted for.
+
+**Real fix applied:** both `check_exit()` (backtest.py) and
+`check_exits()` (crypto_daily_ml_v3.py) now cap the TRAIL_BE fill at
+`min(be_trigger_px, that_day's_open)` — i.e. aim to lock the trigger gain,
+but never assume a better fill than what the day's own open shows was
+achievable. This is the honest version of the session-13 fix: still
+weakly better than flat breakeven by construction (can only tie or beat
+it, never underperform, since `min(higher_target, x) >= min(lower_target,
+x)` always), but the realistically-achievable improvement is on the order
+of **single-digit dollars on a $10,000 backtest**, not a CAGR-tripling
+result. Re-ran `FAST_MODE=true DATA_SOURCE=kraken python backtest.py`
+with the corrected code: **CAGR 0.1%, PF 1.60, Sharpe 1.61, TRAIL_BE net
+-$15.79** — statistically indistinguishable from the ORIGINAL pre-session-13
+baseline (CAGR 0.1%, PF 1.56, TRAIL_BE net -$16.32). **Net result of this
+entire session's TRAIL_BE work: essentially zero real improvement.** The
+only thing that changed for the better is that the code now MODELS the
+mechanism honestly (aims to protect the armed gain, capped at what's
+realistically fillable) instead of either being flatly wrong (old bug,
+assumed exactly $0 gain) or optimistically wrong (first fix, assumed the
+full untouched trigger level).
+
+**What this means going forward:** don't trust a `FAST_MODE`/exact-mode
+backtest number just because it's cross-validated on a second dataset —
+both the 2yr Kraken AND 8yr Binance checks "confirmed" the inflated
+number, because the SAME architectural bug is baked into both datasets'
+simulation code identically (this is exactly lesson 5's warning: an
+OOS/second-dataset check cannot catch a bug that's structurally identical
+in every window it's fed). The check that actually caught it was pulling
+independent ground-truth OHLCV and auditing the fill assumption against
+real intraday-adjacent data (the day's own open), not another walk-forward
+run. Exact-mode confirmation of the corrected code was launched
+(`FAST_MODE=false DATA_SOURCE=kraken`, ~28min) — check
+`/tmp/exact_corrected.log` if still on disk, or re-run fresh.
+
+**Not reverted, corrected in place:** the original flat-breakeven bug
+(guaranteed $0.00 gross, i.e. a certain fee-only loss with literally zero
+chance of a gain) was still real and still wrong to leave as-is — the
+current, doubly-corrected code is the most honest version to keep, it
+just doesn't move the needle on the strategy's edge. Session 12's core
+finding stands, unchanged and now further confirmed: **the edge here is
+structurally thin, and no amount of exit-mechanics polish found this
+session manufactures a bigger one.** The open question is still the same
+one from session 12 — try different features / hold times / threshold
+regime — not exit-rule bookkeeping.
 
 ---
 

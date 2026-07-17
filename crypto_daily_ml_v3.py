@@ -739,16 +739,24 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
 
     Trailing stop logic:
       Once daily HIGH reaches entry × (1 + BREAKEVEN_TRIGGER), the
-      effective SL is raised to entry × (1 + BREAKEVEN_TRIGGER) — i.e. it
-      locks in the gain that armed it, not flat entry price. (Session 13
-      edge-search fix: the old flat-breakeven version exited every
-      TRAIL_BE trade at exactly $0.00 gross, making it a guaranteed
-      fee-only loss 100% of the time — verified against the session-12
-      backtest log where all 131 TRAIL_BE trades had pnl_gross exactly
-      0.0. Locking the trigger gain instead turned TRAIL_BE from a
-      reliable -$22.78 drag into a reliable +$44.71 contributor on the
-      same 2yr Kraken data, and held up on an 8yr Binance bull/bear
-      cross-check too — see PROGRESS.md session 13.)
+      effective SL is raised to target entry × (1 + BREAKEVEN_TRIGGER)
+      (capped at this check-day's open if price already gapped past it)
+      instead of flat entry price. (Session 13 edge-search: the original
+      flat-breakeven version exited every TRAIL_BE trade at exactly
+      $0.00 gross -- a guaranteed fee-only loss 100% of the time. First
+      fix attempt assumed a fill AT the theoretical trigger level, which
+      looked like a 3x CAGR improvement in backtest -- but that was
+      ~96-98% a backtest-accounting artifact: trailing_active only arms
+      the day AFTER price touches the trigger, so by the time the exit
+      actually fires, price has almost always already fallen back
+      through the trigger level before that day's own open print
+      (confirmed against real OHLCV: 87/87 trades on 2yr Kraken data,
+      411/414 on 8yr Binance data). Capping the fill at the day's open
+      when it gapped past the target removed nearly all of the illusory
+      gain -- the real, defensible improvement over flat breakeven is
+      small (roughly +$2-5 per ~100 trades at 1% sizing on $10k), not the
+      originally-reported +$44-139. See PROGRESS.md session 13 for the
+      full correction and how it was caught.)
       Checked in order: TP first, then trailing SL, then fixed SL.
     """
     to_close = []
@@ -783,6 +791,7 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
             logger.warning(f'  {sym}: no complete candle for {check_dt} — skip check')
             continue
 
+        daily_open = float(check_row['open'].iloc[0])
         daily_high = float(check_row['high'].iloc[0])
         daily_low  = float(check_row['low'].iloc[0])
         close_px   = float(check_row['close'].iloc[0])
@@ -824,9 +833,21 @@ def check_exits(open_positions: list, ohlcv_data: dict, today: str) -> list:
             exit_pnl   = TAKE_PROFIT_PCT
         elif sl_hit:
             if trailing_active:
-                reason     = 'TRAIL_BE'          # trailing stop, locks in the trigger gain
-                exit_price = be_trigger_px
-                exit_pnl   = BREAKEVEN_TRIGGER
+                # trailing_active only arms starting the day AFTER price
+                # first touched be_trigger_px (the scan above excludes the
+                # day being checked) -- so by the time this fires, price
+                # has typically already fallen back through be_trigger_px
+                # before this check-day's own open print. Session 13
+                # edge-search found this made the naive "assume fill at
+                # be_trigger_px" version overstate backtested CAGR/PF/
+                # Sharpe by ~96-98% of the reported improvement (verified
+                # against real OHLCV, PROGRESS.md session 13 correction).
+                # Cap at this day's open, same as a resting stop-market
+                # order would actually fill if price gapped past the
+                # trigger before the order could act on it.
+                reason     = 'TRAIL_BE'
+                exit_price = min(be_trigger_px, daily_open)
+                exit_pnl   = (exit_price - entry_px) / entry_px
             else:
                 reason     = 'SL'
                 exit_price = sl_price

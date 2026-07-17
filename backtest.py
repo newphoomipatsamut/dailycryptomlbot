@@ -415,6 +415,7 @@ def check_exit(pos: dict, today_dt: date_t, today_row: pd.Series) -> dict | None
     if hold_days == 0:
         return None   # never exit same day as entry
 
+    daily_open = float(today_row['open'])
     daily_high = float(today_row['high'])
     daily_low  = float(today_row['low'])
     close_px   = float(today_row['close'])
@@ -434,7 +435,24 @@ def check_exit(pos: dict, today_dt: date_t, today_row: pd.Series) -> dict | None
         result = {'reason': 'TP',     'exit_price': tp_price,  'pnl_pct':  TAKE_PROFIT_PCT}
     elif sl_hit:
         if trailing:
-            result = {'reason': 'TRAIL_BE', 'exit_price': be_trigger_px, 'pnl_pct': BREAKEVEN_TRIGGER}
+            # trailing_active can only arm starting the day AFTER price
+            # first touched be_trigger_px (see the update at the bottom of
+            # this function) -- it is never checked against the arm day's
+            # own low. Verified against real OHLCV (session 13 edge-search
+            # validation): by the day this condition is confirmed, price
+            # has close to always already dropped back through
+            # be_trigger_px before that day's OPEN print -- 87/87 on a 2yr
+            # Kraken sample, 411/414 on an 8yr Binance sample. Assuming a
+            # fill AT be_trigger_px there overstates the realistically
+            # achievable price by ~entry*BREAKEVEN_TRIGGER on nearly every
+            # trade (confirmed this was ~96-98% of the originally reported
+            # CAGR/PF/Sharpe improvement -- see PROGRESS.md session 13
+            # correction). Cap at the day's open, the same way a resting
+            # stop-market order would actually fill if price gapped past
+            # the trigger level before the order could act on it.
+            fill_px = min(be_trigger_px, daily_open)
+            result = {'reason': 'TRAIL_BE', 'exit_price': fill_px,
+                      'pnl_pct': (fill_px - entry_px) / entry_px}
         else:
             result = {'reason': 'SL',       'exit_price': sl_price,  'pnl_pct': -STOP_LOSS_PCT}
     elif hold_days >= MAX_HOLD_DAYS:
