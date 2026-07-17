@@ -181,9 +181,13 @@ OOS/second-dataset check cannot catch a bug that's structurally identical
 in every window it's fed). The check that actually caught it was pulling
 independent ground-truth OHLCV and auditing the fill assumption against
 real intraday-adjacent data (the day's own open), not another walk-forward
-run. Exact-mode confirmation of the corrected code was launched
-(`FAST_MODE=false DATA_SOURCE=kraken`, ~28min) — check
-`/tmp/exact_corrected.log` if still on disk, or re-run fresh.
+run. **Exact-mode confirmation (`FAST_MODE=false DATA_SOURCE=kraken`)
+completed and matches:** CAGR 0.3%, PF 1.78, Sharpe 2.44, Calmar 8.05, 355
+trades, TRAIL_BE net -$23.10 — statistically the same as the ORIGINAL
+pre-session-13 baseline (CAGR 0.2-0.7% across the various pre-session-13
+runs, PF 1.81, TRAIL_BE -$22.78 on the comparable 335-trade run). Full
+fidelity confirmation that the correction holds, not just a FAST_MODE
+artifact.
 
 **Not reverted, corrected in place:** the original flat-breakeven bug
 (guaranteed $0.00 gross, i.e. a certain fee-only loss with literally zero
