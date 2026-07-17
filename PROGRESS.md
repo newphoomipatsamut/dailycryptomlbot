@@ -5,6 +5,88 @@ Read this first before touching the bot or the backtest.
 
 ---
 
+## Same session 13 — edge-search attempt #2: probability calibration is a dead end; TP-tightening improves consistency but NOT dollar returns on the more robust dataset.
+
+User authorized real edge-search R&D (declined live stop-loss validation for
+now — see the section below this one — and asked to look for a bigger edge
+instead of pushing sizing further).
+
+**Finding 1 — the model's probability score carries no usable signal beyond
+the entry threshold.** Bucketed all 355 corrected exact-mode trades into
+probability quartiles (0.60-0.62 / 0.63-0.66 / 0.66-0.71 / 0.71-0.83):
+win rate and PF do NOT improve monotonically with higher signal_prob — the
+LOWEST quartile had the best PF (2.06), not the highest (1.67). Correlation
+between `signal_prob` and `pnl_net` across all trades: **-0.01** (no
+relationship). This explains, retroactively, why raising `SIGNAL_THRESHOLD`
+always made things worse in every session that tried it (session 2's OFI
+gate, session 8's XGB regularization check, and this session's 0.65 test) —
+it was never filtering for quality, just discarding volume at random. Any
+future "raise the threshold to be more selective" idea should be treated as
+dead on arrival unless the underlying probability calibration itself changes.
+
+**Finding 2 — TAKE_PROFIT_PCT sweep (2%/2.5%/3%/5%/8%, FAST_MODE Kraken):**
+smooth, monotonic curve, not a noisy overfit spike — tightening the target
+improves win rate and PF steadily (win rate 3.0%→36.9%, 2.0%→54.9%,
+1.5%→65.4%; PF 3.0%→1.60, 2.0%→2.10, 1.5%→2.20) while loosening it collapses
+both (5.0%→21.2%/PF 1.19, 8.0%→9.5%/PF 0.61, net LOSS). Checked the "are we
+leaving profit on the table" hypothesis directly against real OHLCV: of 136
+trades that hit the current 3% TP, mean max-favorable-excursion over the
+next 5 days was 9.3% (79% reached 5%+, 45% reached 8%+) — looked like real
+room to extend, but this was a selection-biased sample (trades that already
+hit 3% are, by definition, ones that kept going) and the actual backtest of
+wider targets falsified that reading immediately: 5% and 8% TP are
+substantially WORSE, not better.
+
+**TP=2.0% validated on BOTH held-out checks — mixed result, not a clean
+win:**
+
+| | Kraken 2yr exact-mode |  | 8yr Binance fast-mode |  |
+|---|---:|---:|---:|---:|
+| | TP=3.0% (base) | TP=2.0% | TP=3.0% (base) | TP=2.0% |
+| CAGR | 0.3% | 0.3% | 0.4% | 0.3% |
+| Total return | 0.5% | 0.5% | 3.1% | 2.4% |
+| Profit factor | 1.78 | 2.07 | 2.77 | 2.86 |
+| Sharpe | 2.44 | 3.26 | 3.88 | 4.30 |
+| Win rate | 40.3% | 57.1% | 48.9% | 63.1% |
+
+(8yr Binance TP=3.0% column re-run fresh with the CORRECTED TRAIL_BE code —
+NOT the debunked PF-5.56 number from earlier this session, which must never
+be quoted again as a real baseline.)
+
+**Honest read: tightening TP makes the strategy smoother and higher-hit-rate
+(better PF/Sharpe/win-rate on BOTH datasets), but does NOT increase dollar
+CAGR — it's a wash on the 2yr Kraken window and slightly WORSE on the more
+robust 8yr Binance window (0.4%→0.3% CAGR, 3.1%→2.4% total return).** This
+does not answer the user's actual ask (meaningful absolute returns) — it's
+the same shape of result as the TRAIL_BE fix and the sizing-math finding
+earlier this session: exit-mechanics/parameter tweaks can reshape the RISK
+profile of the existing edge (smoother equity curve, higher win rate,
+better Sharpe) but cannot manufacture more dollar edge than what the entry
+signal actually contains. **Not adopted into the live code** — no
+correctness bug here (unlike the TRAIL_BE case), just a parameter that
+trades one kind of "better" (consistency) for not-clearly-better (or
+slightly worse) total return, so there's no clear-cut reason to change the
+default. If win-rate/psychological-consistency ever becomes a stated goal
+in its own right, TP≈2% is the number to revisit.
+
+**Where this leaves the edge-search:** two independent levers now tested
+(exit-mechanics correctness via TRAIL_BE, exit-target tuning via TP) both
+confirm the same thing — the entry signal itself is the bottleneck, not the
+exit rules around it. The only way to find a bigger edge from here is
+almost certainly a change to the ENTRY side (different/better features, a
+model that actually produces well-calibrated probabilities, a different
+symbol set, or a different timeframe) — not another parameter sweep on the
+exit side. That's a bigger, more open-ended research task than anything
+tried so far this session, with no guaranteed payoff.
+
+`TAKE_PROFIT_PCT` and `SIGNAL_THRESHOLD` are now env-overridable in
+`backtest.py` (research-only, matching the existing `DATA_SOURCE`/
+`OFI_GATE_ENABLED`/`FAST_MODE` pattern) to make future sweeps like this
+cheap to rerun. Not touched in `crypto_daily_ml_v3.py` — the live bot's
+constants are unchanged.
+
+---
+
 ## 2026-07-17 (session 13) — Resumed after the pause: health check + closed out the one loose end from session 12.
 
 Pulled `origin/main` (2 new automated commits, `2026-07-15`/`2026-07-16` daily
@@ -199,6 +281,71 @@ structurally thin, and no amount of exit-mechanics polish found this
 session manufactures a bigger one.** The open question is still the same
 one from session 12 — try different features / hold times / threshold
 regime — not exit-rule bookkeeping.
+
+---
+
+## Same session 13 — real-order stop-loss validation attempted and declined; sizing sensitivity redone on the CORRECTED trade sequence, and it changes the prior recommendation.
+
+**Real-order validation attempt: inconclusive, then declined.** User ran
+`validate_stop_loss.py` themselves (correctly, per its own docstring —
+never pasted keys into chat... except once, see below). It failed at the
+very first step: Kraken rejected the $20 buy for insufficient USDT funds,
+before the code ever reached stop-loss placement, confirmation,
+cancellation, or market-sell. The `finally` cleanup ran correctly (0 open
+orders, 0 position left behind) — a harmless failure, but it validates
+NOTHING about the stop-loss mechanism itself, only that
+`place_live_order()` handles a real Kraken rejection cleanly. User chose
+not to fund the test further and explicitly said to skip live validation
+for now. **Status unchanged from session 9: the resting stop-loss
+order → confirm-on-book → cancel → market-sell execution path remains
+UNEXERCISED against any real Kraken order, mock-tested only.** This is a
+consciously accepted gap, not an oversight — flag it again before ever
+raising `RISK_PER_TRADE` for a real (non-paper) run, and especially don't
+let it get silently forgotten if a future session revisits sizing without
+rereading this.
+
+**Security incident, same exchange: user pasted a real Kraken API key AND
+secret directly into the chat** while setting up the key for the above
+test. Declined to use the credentials (this is exactly what the script's
+own docstring says not to do — "run this yourself... not through an
+assistant tool"), told the user to revoke/rotate immediately since chat
+history is exposure regardless of intent, and did not echo the key back
+or store it anywhere. No evidence the credentials were ever used by this
+assistant. **Whether the user actually revoked/rotated the key was not
+confirmed by end of session — check this before assuming it's handled.**
+
+**Sizing sensitivity redone on the corrected 355-trade exact-mode sequence
+— this SUPERSEDES session 12's "5-10% risk → 4-9% CAGR" claim, which was
+computed on stale/different data and does not hold up.** Replayed the
+current `backtest_trades_kraken.csv` (the corrected exact-mode run) at
+various `RISK_PER_TRADE` values, scaling `trade_size` and recompounding
+day-by-day (trade sequence/count is sizing-independent — verified this
+holds, since entry timing only depends on signal + slot availability, not
+dollar size):
+
+| risk/trade | total return | CAGR  | max DD |
+|-----------:|--------------:|------:|-------:|
+| 1% (current) | 0.50%       | 0.29% | -0.03% |
+| 5%         | 2.52%         | 1.47% | -0.16% |
+| 10%        | 5.11%         | 2.97% | -0.32% |
+| 15%        | 7.75%         | 4.48% | -0.48% |
+| 20%        | 10.46%        | 6.02% | -0.63% |
+| 25% (old default) | 13.24%  | 7.57% | -0.79% |
+
+Because total returns are small enough that compounding barely matters
+over this ~2yr window, CAGR scales almost exactly linearly with
+`RISK_PER_TRADE` — there is no sizing "sweet spot," just a straight
+risk/reward trade dial. **To reach the 4-9% CAGR range session 12 called
+"worth someone's time" on the CORRECTED numbers requires ~15-25% risk per
+trade — i.e. close to or at the OLD 25% default that session 10
+deliberately cut to 1%, specifically because of thin live evidence (n=10)
+and the exit-execution code being unexercised.** That second reason is
+now, this same session, a CONSCIOUSLY ACCEPTED gap rather than an
+open TODO — raising sizing back toward 15-25% while that's still true
+means running an amplified, real-money-eventually position through a
+codepath nobody has watched execute for real. Decision on where to land
+(if anywhere) not yet made as of this log entry — continue in
+conversation / next log entry.
 
 ---
 

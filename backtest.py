@@ -76,7 +76,7 @@ RISK_PER_TRADE    = 0.01   # TOTAL portfolio risk budget, divided across up to
                            # these two changes — they scale with position
                            # size. Win rate/PF/trade count are still
                            # comparable (sizing-independent).
-TAKE_PROFIT_PCT   = 0.030
+TAKE_PROFIT_PCT   = float(os.environ.get('TAKE_PROFIT_PCT', 0.030))  # env override kept for edge-search screening, see session 13
 STOP_LOSS_PCT     = 0.010
 MAX_HOLD_DAYS     = 5
 MAX_POSITIONS     = 3
