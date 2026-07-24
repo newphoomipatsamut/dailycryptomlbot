@@ -1,1 +1,2 @@
 row_id,date,symbol,action,entry_price,exit_price,pnl_gross,pnl_net,fees,reason,hold_days,win,balance_after,signal_prob,rf_prob,xgb_prob,trade_size,stop_order_id,fill_qty
+T0001,2026-07-24,ETH/USDT,OPEN,1879.48,,,,,,,,10000.0,0.6262,0.6368,0.6155,33.3333,,
