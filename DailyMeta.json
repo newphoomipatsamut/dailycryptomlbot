@@ -1,7 +1,7 @@
 {
-  "balance": 10000.0,
-  "balance_updated": "2026-07-25T03:31:06.437714+00:00",
+  "balance": 9999.5081,
+  "balance_updated": "2026-07-26T03:46:06.969466+00:00",
   "halted": "False",
-  "kill_switch_updated": "2026-07-25T03:31:06.438037+00:00",
+  "kill_switch_updated": "2026-07-26T03:46:06.969698+00:00",
   "peak_balance": 10000.0
 }
